@@ -1,0 +1,17 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+
+AlignAfterOpenBracket: DontAlign
+ColumnLimit: 108
+FixNamespaceComments: true
+PointerAlignment: Left
+ReferenceAlignment: Pointer
+ReflowComments: true
+SortIncludes: CaseSensitive
+SpacesBeforeTrailingComments: 1
+SpacesInLineCommentPrefix:
+  Minimum: 1
+  Maximum: 1
+Standard: c++20
+UseTab: Never

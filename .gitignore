@@ -1,0 +1,9 @@
+# Builds
+/out/
+
+# IDEs
+.vs/
+.vscode/
+
+# Other.
+/junk/
