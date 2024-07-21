@@ -89,7 +89,7 @@ TEST_CASE("Check consistency on read") {
   REQUIRE(std::filesystem::exists(path));
   int fd = ::open(path.c_str(), O_WRONLY);
   REQUIRE(fd != -1);
-  REQUIRE(::pwrite(fd, "x", 1, sizeof(uint64_t) + sizeof(bitcask::format::Entry) + 2) != -1);
+  REQUIRE(::pwrite(fd, "x", 1, sizeof(uint64_t) + sizeof(bitcask::detail::Entry) + 2) != -1);
   ::close(fd);
 
   REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));

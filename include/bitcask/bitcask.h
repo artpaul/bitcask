@@ -8,7 +8,6 @@
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
-#include <iostream>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -34,7 +33,7 @@
 #endif
 
 namespace bitcask {
-namespace format {
+namespace detail {
 
 // |---------------------------------------------------|
 // |          The layout of the data record            |
@@ -90,7 +89,7 @@ static_assert(sizeof(Footer) == 16);
 
 #pragma pack(pop)
 
-} // namespace format
+} // namespace detail
 
 class Status {
   enum class Code {
@@ -168,7 +167,7 @@ class Status {
 };
 
 struct Options {
-  uint64_t max_file_size = 4ull << 30;
+  uint32_t max_file_size = std::numeric_limits<uint32_t>::max();
 
   /// Flush in-core data to storage device after write.
   bool data_sync = false;
@@ -217,7 +216,7 @@ class Database {
  public:
   Status Pack(bool force = false);
 
-  /// Close the current active file.
+  /// Close current active file.
   Status Rotate();
 
  private:
@@ -311,15 +310,14 @@ class Database {
 
   /// @brief Writes the data to the active data file.
   ///
-  /// @returns offset of the written record or an error code if the write was
-  /// unseccessful.
-  Status WriteEntry(const std::string_view key, const std::string_view value, const uint64_t timestamp,
-      const bool is_tombstone, const bool sync, Record& record);
+  /// @returns written record or an error code if the write was unseccessful.
+  std::pair<Record, Status> WriteEntry(const std::string_view key, const std::string_view value,
+      const uint64_t timestamp, const bool is_tombstone, const bool sync);
 
   /// @brief Writes record to the data file provided by \p cb
-  static Status WriteEntryToFile(const std::string_view key, const std::string_view value,
-      const uint64_t timestamp, const bool is_tombstone, const bool sync,
-      const std::function<FileInfoStatus(size_t)>& cb, Record& record);
+  static std::pair<Record, Status> WriteEntryToFile(const std::string_view key,
+      const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync,
+      const std::function<FileInfoStatus(size_t)>& cb);
 
  private:
   struct StringHash {
@@ -445,30 +443,31 @@ inline std::optional<int> ParseLayoutIndex(std::string_view name) {
   return {};
 }
 
-inline Status ReadEntryImpl(const int fd, const size_t initial_offset, const bool check_crc,
-    format::Entry& entry, std::string& key, std::string& value, size_t& read) {
-  size_t offset = initial_offset;
+/// Reads full content of an entry.
+inline std::tuple<size_t, Status> ReadEntryImpl(const int fd, const size_t offset, const bool check_crc,
+    Entry& entry, std::string& key, std::string& value) {
+  size_t current_offset = offset;
   uint64_t crc;
   Status status;
   // Load crc.
-  if (!(status = LoadFromFile(fd, &crc, sizeof(crc), offset))) {
-    return status;
+  if (!(status = LoadFromFile(fd, &crc, sizeof(crc), current_offset))) {
+    return {{}, status};
   }
   // Load entry.
-  if (!(status = LoadFromFile(fd, &entry, sizeof(entry), offset))) {
-    return status;
+  if (!(status = LoadFromFile(fd, &entry, sizeof(entry), current_offset))) {
+    return {{}, status};
   }
   // Validate entry.
   // TODO: max_value_size
   key.resize(entry.key_size);
   value.resize(entry.value_size);
   // Load value.
-  if (!(status = LoadFromFile(fd, value.data(), value.size(), offset))) {
-    return status;
+  if (!(status = LoadFromFile(fd, value.data(), value.size(), current_offset))) {
+    return {{}, status};
   }
   // Load key.
-  if (!(status = LoadFromFile(fd, key.data(), key.size(), offset))) {
-    return status;
+  if (!(status = LoadFromFile(fd, key.data(), key.size(), current_offset))) {
+    return {{}, status};
   }
 
   // Check crc.
@@ -480,13 +479,11 @@ inline Status ReadEntryImpl(const int fd, const size_t initial_offset, const boo
     };
 
     if (CalculateCrc(parts) != crc) {
-      return Status::Inconsistent();
+      return {{}, Status::Inconsistent()};
     }
   }
 
-  read = offset - initial_offset;
-
-  return {};
+  return {current_offset - offset, {}};
 }
 
 } // namespace detail
@@ -584,10 +581,10 @@ Status Database::Delete(const WriteOptions& options, const std::string_view key)
   }
 
   [[maybe_unused]] detail::Defer d([this, key] { UnlockKey(key); });
-  Record record;
   // Write the tombstone.
-  if (auto ret = WriteEntry(key, {}, timestamp.value(), true, options.sync, record); !ret) {
-    return ret;
+  auto [_, status] = WriteEntry(key, {}, timestamp.value(), true, options.sync);
+  if (!status) {
+    return status;
   }
 
   // Update key-set
@@ -648,11 +645,10 @@ Status Database::Put(
   const uint64_t timestamp = ++clock_;
 
   [[maybe_unused]] detail::Defer d([this, key] { UnlockKey(key); });
-  Record record;
   // Write the value with the specific timestamp.
-  auto ret = WriteEntry(key, value, timestamp, false, options_.data_sync || options.sync, record);
-  if (!ret) {
-    return ret;
+  auto [record, status] = WriteEntry(key, value, timestamp, false, options.sync);
+  if (!status) {
+    return status;
   }
 
   // Update key-set
@@ -770,19 +766,18 @@ Status Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file,
   uint64_t file_size = file->size;
 
   while (offset < file_size) {
-    format::Entry e;
+    detail::Entry e;
     std::string key;
     std::string value;
-    size_t read;
-    auto ret = detail::ReadEntryImpl(file->fd, offset, false, e, key, value, read);
-    if (!ret) {
-      return ret;
+    auto [read, status] = detail::ReadEntryImpl(file->fd, offset, false, e, key, value);
+    if (!status) {
+      return status;
     }
 
     const Record record{
         .file = file.get(),
         .timestamp = e.timestamp,
-        .offset = uint32_t(offset + sizeof(uint64_t) + sizeof(format::Entry)),
+        .offset = uint32_t(offset + sizeof(uint64_t) + sizeof(detail::Entry)),
         .size = uint32_t(value.size()),
     };
 
@@ -884,9 +879,7 @@ Status Database::PackFiles(
       return {};
     }
 
-    Record rec;
-    const auto status = WriteEntryToFile(
-        key, value, record.timestamp, is_tombstone, false,
+    const auto [rec, status] = WriteEntryToFile(key, value, record.timestamp, is_tombstone, false,
         // Target file provider.
         [&](const size_t length) -> FileInfoStatus {
           const auto& [i, index] = [&]() -> std::tuple<int, int> {
@@ -900,16 +893,16 @@ Status Database::PackFiles(
           }();
 
           if (output[i].empty() || output[i].back()->size + length > options_.max_file_size) {
-            auto ret = MakeWritableFile(std::to_string(index) + "-" + std::to_string(++clock_) + ".dat");
-            if (!ret.second) {
-              return ret;
+            auto [file, status] =
+                MakeWritableFile(std::to_string(index) + "-" + std::to_string(++clock_) + ".dat");
+            if (!status) {
+              return {{}, status};
             }
 
-            output[i].push_back(std::move(ret.first));
+            output[i].push_back(std::move(file));
           }
-          return std::make_pair(output[i].back(), Status());
-        },
-        rec);
+          return {output[i].back(), {}};
+        });
 
     if (status) {
       updates.emplace_back(ki, rec);
@@ -1050,12 +1043,10 @@ Status Database::ReadValue(const ReadOptions& options, const Record& record, std
   record.file->EnsureReadable();
 
   if (options.verify_checksums) {
-    size_t offset = record.offset - (sizeof(uint64_t) + sizeof(format::Entry));
-    format::Entry e;
+    size_t offset = record.offset - (sizeof(uint64_t) + sizeof(detail::Entry));
+    detail::Entry e;
     std::string key;
-    size_t read;
-    auto ret = detail::ReadEntryImpl(record.file->fd, offset, true, e, key, value, read);
-    return ret;
+    return std::get<1>(detail::ReadEntryImpl(record.file->fd, offset, true, e, key, value));
   } else {
     size_t offset = record.offset;
     // Allocate memory for the value.
@@ -1065,64 +1056,64 @@ Status Database::ReadValue(const ReadOptions& options, const Record& record, std
   }
 }
 
-Status Database::WriteEntry(const std::string_view key, const std::string_view value,
-    const uint64_t timestamp, const bool is_tombstone, const bool sync, Record& record) {
+std::pair<Database::Record, Status> Database::WriteEntry(const std::string_view key,
+    const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync) {
   // Exclusive access for writing to active file.
   std::unique_lock write_lock(write_mutex_, std::defer_lock);
 
-  return WriteEntryToFile(
-      key, value, timestamp, is_tombstone, sync,
-      // Target file provider.
-      [&](const uint32_t length) -> FileInfoStatus {
-        // Acquire exclusive access for writing to active file.
-        write_lock.lock();
+  // Target file provider.
+  const auto& file_provider = [&](const uint32_t length) -> FileInfoStatus {
+    // Acquire exclusive access for writing to active file.
+    write_lock.lock();
 
-        // Check the capacity of the current active file and close it if there
-        // is not enough space left for writing.
-        if (active_file_) {
-          if (active_file_->size + length > options_.max_file_size) {
-            active_file_->CloseFile(sync);
+    // Check the capacity of the current active file and close it if there
+    // is not enough space left for writing.
+    if (active_file_) {
+      if (active_file_->size + length > options_.max_file_size) {
+        active_file_->CloseFile(sync);
 
-            // Acquire exclusive access to list of data files.
-            std::lock_guard file_lock(file_mutex_);
-            // Move data file into the read-only set.
-            files_[0].push_back(std::move(active_file_));
-          }
-        }
+        // Acquire exclusive access to list of data files.
+        std::lock_guard file_lock(file_mutex_);
+        // Move data file into the read-only set.
+        files_[0].push_back(std::move(active_file_));
+      }
+    }
 
-        // Create a new active file if none exists.
-        if (!bool(active_file_)) {
-          auto result = MakeWritableFile("00-0000-" + std::to_string(++clock_) + ".dat");
-          if (result.second) {
-            active_file_ = std::move(result.first);
-          } else {
-            return {{}, result.second};
-          }
-        }
+    // Create new active file if none exists.
+    if (!bool(active_file_)) {
+      auto [file, status] = MakeWritableFile("00-0000-" + std::to_string(++clock_) + ".dat");
+      if (status) {
+        active_file_ = std::move(file);
+      } else {
+        return {file, status};
+      }
+    }
 
-        return {active_file_, {}};
-      },
-      record);
+    return {active_file_, {}};
+  };
+
+  return WriteEntryToFile(key, value, timestamp, is_tombstone, sync, file_provider);
 }
 
-Status Database::WriteEntryToFile(const std::string_view key, const std::string_view value,
-    const uint64_t timestamp, const bool is_tombstone, const bool sync,
-    const std::function<FileInfoStatus(size_t)>& cb, Record& record) {
+std::pair<Database::Record, Status> Database::WriteEntryToFile(const std::string_view key,
+    const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync,
+    const std::function<FileInfoStatus(size_t)>& cb) {
   assert(!is_tombstone || value.empty());
 
-  const size_t length = sizeof(uint64_t) + sizeof(format::Entry) + key.size() + value.size();
-
   uint64_t crc;
-  format::Entry entry;
-  entry.timestamp = timestamp;
-  entry.flags = is_tombstone ? 0x01 : 0x00;
-  entry.key_size = key.size();
-  entry.value_size = value.size();
-
+  // Total size of data to write.
+  const size_t length = sizeof(uint64_t) + sizeof(detail::Entry) + key.size() + value.size();
+  // Fill entry.
+  const detail::Entry entry{
+      .timestamp = timestamp,
+      .flags = uint16_t(is_tombstone ? 0x01 : 0x00),
+      .key_size = uint16_t(key.size()),
+      .value_size = uint32_t(value.size()),
+  };
   // Make parts.
   const std::array parts = {
       detail::Part{.data = &crc, .len = sizeof(crc)},
-      detail::Part{.data = &entry, .len = sizeof(entry)},
+      detail::Part{.data = (void*)&entry, .len = sizeof(entry)},
       detail::Part{.data = (void*)value.data(), .len = value.size()},
       detail::Part{.data = (void*)key.data(), .len = key.size()},
   };
@@ -1131,18 +1122,18 @@ Status Database::WriteEntryToFile(const std::string_view key, const std::string_
 
   const auto [file, status] = cb(length);
   if (!status) {
-    return status;
+    return {{}, status};
   }
-  // Offset at which a new entry will be written.
-  const uint32_t offset = file->size;
+  // Offset at which new entry will be written.
+  const uint64_t offset = file->size;
 
   const ssize_t ret = ::writev(file->fd, (struct iovec*)parts.data(), parts.size());
 
   if (ret == -1) {
-    return Status::IOError(errno);
+    return {{}, Status::IOError(errno)};
   }
   if (ret != length) {
-    return Status::IOError(0);
+    return {{}, Status::IOError(0)};
   }
   // Force flush of written data.
   if (sync) {
@@ -1151,14 +1142,14 @@ Status Database::WriteEntryToFile(const std::string_view key, const std::string_
   // Update size of written data.
   file->size.fetch_add(length);
 
-  record = {
+  auto record = Record{
       .file = file.get(),
       .timestamp = timestamp,
-      .offset = uint32_t(offset + sizeof(uint64_t) + sizeof(format::Entry)),
+      .offset = uint32_t(offset + sizeof(uint64_t) + sizeof(detail::Entry)),
       .size = uint32_t(value.size()),
   };
 
-  return {};
+  return {record, {}};
 }
 
 } // namespace bitcask
