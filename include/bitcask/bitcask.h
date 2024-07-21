@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -35,17 +36,29 @@
 namespace bitcask {
 namespace detail {
 
-// |---------------------------------------------------|
-// |          The layout of the data record            |
-// |---------------------------------------------------|
-// | 64 bit | 64 bit | 32 bit | 32 bit   | var   | var |
-// |--------|--------|--------|----------|-------|-----|
-// | crc    | tstamp | key_sz | value_sz | value | key |
-// |---------------------------------------------------|
-//                                       ^
-//                               In-memory pointer.
+static constexpr size_t kFileMagicSize = 6;
 
-#pragma pack(push, 1)
+static constexpr uint16_t kFileFlagNone = 0x00;
+static constexpr uint16_t kFileFlagWithIndex = 0x01;
+
+static constexpr uint16_t kEntryFlagTombstone = 0x01;
+
+// |------------------------------------------------------------|
+// |                The layout of the data record               |
+// |------------------------------------------------------|-----|
+// | 64 bit | 64 bit | 16 bit |16 bit  | 32 bit   | var   | var |
+// |--------|--------|--------|--------|----------|-------|-----|
+// | crc    | tstamp | flags  | key_sz | value_sz | value | key |
+// |------------------------------------------------------|-----|
+//                                                ^
+//                                       In-memory pointer.
+
+struct Header {
+  /// Magic constant ('BCSK') to identify the type of the file.
+  char magic[kFileMagicSize];
+  /// Various flags for the data file.
+  uint16_t flags;
+};
 
 struct Entry {
   /// The update time of the record.
@@ -57,7 +70,7 @@ struct Entry {
   /// The size of the record's value.
   uint32_t value_size;
 
-  constexpr bool is_tobstone() const noexcept { return (flags & 0x01) != 0; }
+  constexpr bool is_tobstone() const noexcept { return (flags & kEntryFlagTombstone) != 0; }
 };
 
 struct Index {
@@ -83,11 +96,10 @@ struct Footer {
   uint64_t index;
 };
 
+static_assert(sizeof(Header) == 8);
 static_assert(sizeof(Entry) == 16);
 static_assert(sizeof(Index) == 24);
 static_assert(sizeof(Footer) == 16);
-
-#pragma pack(pop)
 
 } // namespace detail
 
@@ -176,7 +188,7 @@ struct Options {
   bool read_only = false;
 
   /// Write index at the end of each merged file.
-  bool write_hints = false;
+  bool write_index = false;
 };
 
 /// Options that control read operations
@@ -301,10 +313,10 @@ class Database {
   void WaitKeyUnlocked(const std::string_view key, K& lock) const;
 
  private:
-  Status EnumerateEntries(const std::shared_ptr<FileInfo>& file,
+  Status EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
       const std::function<Status(const Record&, const bool, std::string, std::string)>& cb) const;
 
-  FileInfoStatus MakeWritableFile(const std::string& name) const;
+  FileInfoStatus MakeWritableFile(const std::string& name, bool with_index) const;
 
   Status ReadValue(const ReadOptions& options, const Record& record, std::string& value) const;
 
@@ -760,10 +772,26 @@ Status Database::Rotate() {
   return {};
 }
 
-Status Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file,
+Status Database::EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
     const std::function<Status(const Record&, const bool, std::string, std::string)>& cb) const {
-  uint64_t offset = 0;
+  size_t offset = 0;
   uint64_t file_size = file->size;
+  detail::Header header;
+
+  if (auto s = detail::LoadFromFile(file->fd, &header, sizeof(header), offset); !s) {
+    return s;
+  } else if (std::memcmp(header.magic, "BCSKV1", detail::kFileMagicSize) != 0) {
+    return Status::NotFound();
+  }
+
+  if (header.flags & detail::kFileFlagWithIndex) {
+    detail::Footer footer;
+    size_t footer_offset = file->size - sizeof(footer);
+    if (auto s = detail::LoadFromFile(file->fd, &footer, sizeof(footer), footer_offset); !s) {
+      return s;
+    }
+    file_size = footer.index;
+  }
 
   while (offset < file_size) {
     detail::Entry e;
@@ -781,7 +809,7 @@ Status Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file,
         .size = uint32_t(value.size()),
     };
 
-    auto s = cb(record, (e.flags & 0x01), std::move(key), std::move(value));
+    auto s = cb(record, (e.flags & detail::kEntryFlagTombstone), std::move(key), std::move(value));
     if (!s) {
       return s;
     }
@@ -846,12 +874,14 @@ Status Database::Initialize() {
     if (auto s = file->EnsureReadable(); !s) {
       return s;
     }
+    [[maybe_unused]] detail::Defer do_close([file]() { file->CloseFile(); });
     // Read entries from the file.
-    if (auto s = EnumerateEntries(file, cb); !s) {
+    if (auto s = EnumerateEntriesNoLock(file, cb); !s) {
+      if (s.IsNotFound()) {
+        continue;
+      }
       return s;
     }
-    // Close the file.
-    file->CloseFile();
 
     // Move data file into the read-only set.
     files_.resize(std::max<size_t>(files_.size(), index.value() + 1));
@@ -894,7 +924,7 @@ Status Database::PackFiles(
 
           if (output[i].empty() || output[i].back()->size + length > options_.max_file_size) {
             auto [file, status] =
-                MakeWritableFile(std::to_string(index) + "-" + std::to_string(++clock_) + ".dat");
+                MakeWritableFile(std::to_string(index) + "-" + std::to_string(++clock_) + ".dat", false);
             if (!status) {
               return {{}, status};
             }
@@ -921,7 +951,7 @@ Status Database::PackFiles(
     // Ensure source file is opened.
     file->EnsureReadable();
     // Enumerate all records in the source file.
-    if (auto s = EnumerateEntries(file, cb); !s) {
+    if (auto s = EnumerateEntriesNoLock(file, cb); !s) {
       read_lock.unlock();
       // TODO: finalize.
       return s;
@@ -1019,7 +1049,7 @@ void Database::WaitKeyUnlocked(const std::string_view key, K& lock) const {
   lock.lock(); // Is deadlock possible?
 }
 
-Database::FileInfoStatus Database::MakeWritableFile(const std::string& name) const {
+Database::FileInfoStatus Database::MakeWritableFile(const std::string& name, bool with_index) const {
   static constexpr std::filesystem::perms kDefaultPremissions =
       std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
       std::filesystem::perms::group_read | std::filesystem::perms::others_read;
@@ -1029,8 +1059,17 @@ Database::FileInfoStatus Database::MakeWritableFile(const std::string& name) con
   // Cannot open file for writing.
   if (fd == -1) {
     return {{}, Status::IOError(errno)};
+  } else {
+    const detail::Header header{.magic = {'B', 'C', 'S', 'K', 'V', '1'},
+        .flags = with_index ? detail::kFileFlagWithIndex : detail::kFileFlagNone};
+
+    if (::write(fd, &header, sizeof(header)) == -1) {
+      int err = errno;
+      ::close(fd);
+      return {{}, Status::IOError(err)};
+    }
   }
-  auto file = std::make_shared<FileInfo>(std::move(path), 0);
+  auto file = std::make_shared<FileInfo>(std::move(path), sizeof(detail::Header));
   file->fd = fd;
   return {file, {}};
 }
@@ -1081,7 +1120,7 @@ std::pair<Database::Record, Status> Database::WriteEntry(const std::string_view 
 
     // Create new active file if none exists.
     if (!bool(active_file_)) {
-      auto [file, status] = MakeWritableFile("00-0000-" + std::to_string(++clock_) + ".dat");
+      auto [file, status] = MakeWritableFile("0-" + std::to_string(++clock_) + ".dat", false);
       if (status) {
         active_file_ = std::move(file);
       } else {
@@ -1106,7 +1145,7 @@ std::pair<Database::Record, Status> Database::WriteEntryToFile(const std::string
   // Fill entry.
   const detail::Entry entry{
       .timestamp = timestamp,
-      .flags = uint16_t(is_tombstone ? 0x01 : 0x00),
+      .flags = uint16_t(is_tombstone ? detail::kEntryFlagTombstone : 0x00),
       .key_size = uint16_t(key.size()),
       .value_size = uint32_t(value.size()),
   };

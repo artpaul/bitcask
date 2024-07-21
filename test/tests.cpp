@@ -85,11 +85,13 @@ TEST_CASE("Check consistency on read") {
   REQUIRE(db->Put({}, "abc", "test"));
   db.reset();
 
-  const auto path = temp_dir.GetPath() + "/00-0000-2.dat";
+  const auto path = temp_dir.GetPath() + "/0-2.dat";
   REQUIRE(std::filesystem::exists(path));
   int fd = ::open(path.c_str(), O_WRONLY);
   REQUIRE(fd != -1);
-  REQUIRE(::pwrite(fd, "x", 1, sizeof(uint64_t) + sizeof(bitcask::detail::Entry) + 2) != -1);
+  REQUIRE(
+      ::pwrite(fd, "x", 1,
+          sizeof(bitcask::detail::Header) + sizeof(uint64_t) + sizeof(bitcask::detail::Entry) + 2) != -1);
   ::close(fd);
 
   REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
@@ -123,4 +125,25 @@ TEST_CASE("Record large than max size of file") {
   std::string value;
   REQUIRE(db->Get({}, "abc", &value));
   CHECK(data == value);
+}
+
+TEST_CASE("Unknown file in the directory") {
+  TemporaryDirectory temp_dir;
+  std::unique_ptr<bitcask::Database> db;
+
+  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE(db->Put({}, "abc", "test"));
+  db.reset();
+
+  const auto path = temp_dir.GetPath() + "/5-100.dat";
+  const auto data = std::string_view("some content larger than header");
+  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT, 0666);
+  REQUIRE(fd != -1);
+  REQUIRE(::write(fd, data.data(), data.size()) != -1);
+  ::close(fd);
+
+  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  std::string value;
+  REQUIRE(db->Get({.verify_checksums = true}, "abc", &value));
+  CHECK(value == "test");
 }
