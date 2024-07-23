@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <set>
+#include <thread>
 
 #include "catch.hpp"
 #include "temp_directory.h"
@@ -181,4 +182,50 @@ TEST_CASE("Write multiple active files") {
   std::string tmp;
   REQUIRE(db->Get({.verify_checksums = true}, std::to_string(512), &tmp));
   CHECK(tmp == "some content larger than header512");
+}
+
+TEST_CASE("Write single key by multiple threads") {
+  TemporaryDirectory temp_dir;
+  std::unique_ptr<bitcask::Database> db;
+
+  REQUIRE(bitcask::Database::Open({.max_file_size = 16 << 10}, temp_dir.GetPath(), db));
+
+  std::vector<std::thread> threads;
+  const std::string value = "some content larger than header";
+  const auto do_check = [&] {
+    for (size_t i = 0; i < 5000; ++i) db->Get({}, "abc", nullptr);
+  };
+  const auto do_delete = [&] {
+    for (size_t i = 0; i < 50; ++i) db->Delete({}, value);
+  };
+  const auto do_write = [&] {
+    for (size_t i = 0; i < 1000; ++i) db->Put({}, "abc", value);
+  };
+
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_check);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_delete);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_delete);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_delete);
+  threads.emplace_back(do_check);
+  threads.emplace_back(do_delete);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_delete);
+  threads.emplace_back(do_write);
+
+  for (auto& t : threads) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+  std::string tmp;
+  auto s = db->Get({}, "abc", &tmp);
+  CHECK((s.IsNotFound() || (s.IsSuccess() && tmp == value)));
 }

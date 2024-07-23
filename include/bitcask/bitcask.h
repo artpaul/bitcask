@@ -365,10 +365,9 @@ class Database {
       return status;
     }
 
+    std::unique_lock key_lock(key_mutex_);
     // Update key-set
     if (updated_keys_) {
-      std::unique_lock key_lock(key_mutex_);
-
       const bool present_in_main = keys_.contains(key);
       // During the merging process only the updated_keys_ can be modified.
       if (auto ki = updated_keys_->find(key); ki != updated_keys_->end()) {
@@ -381,8 +380,6 @@ class Database {
         updated_keys_->emplace(std::string(key), Record{});
       }
     } else {
-      std::unique_lock key_lock(key_mutex_);
-
       if (auto ki = keys_.find(key); ki != keys_.end()) {
         keys_.erase(ki);
       }
@@ -413,7 +410,11 @@ class Database {
     }(key);
 
     if (record) {
-      return ReadValue(options, *record, *value);
+      if (value) {
+        return ReadValue(options, *record, *value);
+      } else {
+        return Status::Success();
+      }
     }
 
     return Status::NotFound();
@@ -438,15 +439,12 @@ class Database {
       return status;
     }
 
+    std::unique_lock key_lock(key_mutex_);
     // Update key-set
     if (updated_keys_) {
-      std::unique_lock key_lock(key_mutex_);
-
       // During the merging process only the updated_keys_ can be modified.
       updated_keys_->insert_or_assign(std::string(key), record);
     } else {
-      std::unique_lock key_lock(key_mutex_);
-
       keys_.insert_or_assign(std::string(key), record);
     }
 
@@ -777,7 +775,7 @@ class Database {
     key_locks_.insert(key);
 
     if (lock) {
-      lock->lock(); // Is deadlock possible?
+      lock->lock();
     }
   }
 
@@ -793,8 +791,7 @@ class Database {
   }
 
   /// Waits individual key will be unlocked.
-  template <typename K>
-  void WaitKeyUnlocked(const std::string_view key, K& lock) const {
+  void WaitKeyUnlocked(const std::string_view key, std::shared_lock<std::shared_mutex>& lock) const {
     std::unique_lock lock_lock(lock_mutex_);
 
     // Wait the key will be unlocked by a concurent thread.
@@ -802,7 +799,7 @@ class Database {
       lock_cond_.wait(lock_lock);
     }
 
-    lock.lock(); // Is deadlock possible?
+    lock.lock();
   }
 
  private:
