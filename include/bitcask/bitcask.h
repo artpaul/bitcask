@@ -699,7 +699,9 @@ class Database {
       std::shared_lock read_lock(file->read_mutex);
 
       // Ensure source file is opened.
-      file->EnsureReadable();
+      if (auto s = file->EnsureReadable(); !s) {
+        return s;
+      }
       // Enumerate all records in the source file.
       if (auto s = EnumerateEntriesNoLock(file, cb); !s) {
         read_lock.unlock();
@@ -881,7 +883,9 @@ class Database {
     std::shared_lock read_lock(record.file->read_mutex);
 
     // Ensure file is opened.
-    record.file->EnsureReadable();
+    if (auto s = record.file->EnsureReadable(); !s) {
+      return s;
+    }
 
     if (options.verify_checksums) {
       size_t offset = record.offset - (sizeof(uint64_t) + sizeof(detail::Entry));
