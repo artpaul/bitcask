@@ -1,6 +1,7 @@
 #include <bitcask/bitcask.h>
 
 #include <iostream>
+#include <set>
 
 #include "catch.hpp"
 #include "temp_directory.h"
@@ -18,6 +19,25 @@ TEST_CASE("Create database") {
   std::unique_ptr<bitcask::Database> db;
 
   REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+}
+
+TEST_CASE("Enumerate keys") {
+  TemporaryDirectory temp_dir;
+  std::unique_ptr<bitcask::Database> db;
+
+  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  for (size_t i = 0; i < 5; ++i) {
+    db->Put({}, std::to_string(i), std::to_string(i));
+  }
+
+  db->Delete({}, "2");
+  std::set<std::string> keys;
+  db->Enumerate([&](const std::string_view key) { keys.emplace(key); });
+  REQUIRE(keys.size() == 4);
+  CHECK(keys.contains("0"));
+  CHECK(keys.contains("1"));
+  CHECK(keys.contains("3"));
+  CHECK(keys.contains("4"));
 }
 
 TEST_CASE("Write / Read / Delete") {
@@ -146,4 +166,19 @@ TEST_CASE("Unknown file in the directory") {
   std::string value;
   REQUIRE(db->Get({.verify_checksums = true}, "abc", &value));
   CHECK(value == "test");
+}
+
+TEST_CASE("Write multiple active files") {
+  TemporaryDirectory temp_dir;
+  std::unique_ptr<bitcask::Database> db;
+
+  REQUIRE(bitcask::Database::Open({.max_file_size = 16 << 10}, temp_dir.GetPath(), db));
+  const std::string value = "some content larger than header";
+  for (size_t i = 0; i < 1000; ++i) {
+    db->Put({}, std::to_string(i), value + std::to_string(i));
+  }
+
+  std::string tmp;
+  REQUIRE(db->Get({.verify_checksums = true}, std::to_string(512), &tmp));
+  CHECK(tmp == "some content larger than header512");
 }

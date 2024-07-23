@@ -391,6 +391,15 @@ class Database {
     return {};
   }
 
+  void Enumerate(const std::function<void(const std::string_view)>& cb) const {
+    std::shared_lock op_lock(operation_mutex_);
+    std::shared_lock key_lock(key_mutex_);
+
+    for (const auto& [key, _] : keys_) {
+      cb(key);
+    }
+  }
+
   Status Get(const ReadOptions& options, const std::string_view key, std::string* value) const {
     std::shared_lock op_lock(operation_mutex_);
 
