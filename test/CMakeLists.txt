@@ -7,5 +7,10 @@ target_link_libraries(bitcask_test PRIVATE
   bitcask
 )
 
-add_test(bitcask_test bitcask_test)
+if(UNIX)
+  target_link_libraries(bitcask_test PUBLIC
+    pthread
+  )
+endif()
 
+add_test(bitcask_test bitcask_test)

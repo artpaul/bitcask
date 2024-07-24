@@ -173,7 +173,7 @@ TEST_CASE("Write multiple active files") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open({.max_file_size = 16 << 10}, temp_dir.GetPath(), db));
+  REQUIRE(bitcask::Database::Open({.active_files = 3, .max_file_size = 16 << 10}, temp_dir.GetPath(), db));
   const std::string value = "some content larger than header";
   for (size_t i = 0; i < 1000; ++i) {
     db->Put({}, std::to_string(i), value + std::to_string(i));

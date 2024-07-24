@@ -179,6 +179,9 @@ class Status {
 };
 
 struct Options {
+  /// Number of active files.
+  uint8_t active_files = 1;
+
   uint32_t max_file_size = std::numeric_limits<uint32_t>::max();
 
   /// Flush in-core data to storage device after write.
@@ -311,8 +314,10 @@ class Database {
 
  public:
   ~Database() {
-    if (active_file_) {
-      active_file_->CloseFile(options_.data_sync);
+    for (const auto& item : active_files_) {
+      if (item.file) {
+        item.file->CloseFile(options_.data_sync);
+      }
     }
     for (const auto& parts : files_) {
       std::for_each(parts.begin(), parts.end(), [this](const auto& f) {
@@ -474,7 +479,7 @@ class Database {
             continue;
           }
         }
-        // Grab all accumulated L0 files for processing.
+        // Grab all accumulated files for processing.
         files.swap(files_[cell]);
         // Check if there is something to process.
         if (files.empty()) {
@@ -519,30 +524,30 @@ class Database {
   /// Closes current active file.
   Status Rotate() {
     std::shared_lock op_lock(operation_mutex_);
-    std::shared_ptr<FileInfo> file;
+    std::vector<std::shared_ptr<FileInfo>> files;
 
     if (options_.read_only) {
       return Status::ReadOnly();
     }
 
-    {
+    for (auto& item : active_files_) {
       // Acquire exclusive access for writing to active file.
-      std::lock_guard write_lock(write_mutex_);
+      std::lock_guard write_lock(item.write_mutex);
       // Check if there is a file opened for writing.
-      if (active_file_) {
-        file.swap(active_file_);
-      } else {
-        return {};
+      if (item.file) {
+        files.push_back(std::move(item.file));
       }
     }
 
-    // Close the active file.
-    file->CloseFile(options_.data_sync);
-
+    // Close files for writing.
+    for (const auto& f : files) {
+      f->CloseFile(options_.data_sync);
+    }
     // Acquire exclusive access to the list of data files.
     std::lock_guard file_lock(file_mutex_);
-    // Move data file into the read-only set.
-    files_[0].push_back(std::move(file));
+    // Move data files into the read-only set.
+    files_[0].insert(
+        files_[0].end(), std::make_move_iterator(files.begin()), std::make_move_iterator(files.end()));
 
     return {};
   }
@@ -565,7 +570,7 @@ class Database {
   };
 
   Database(const Options& options, const std::filesystem::path& path)
-      : options_(options), base_path_(path) {
+      : options_(options), base_path_(path), active_files_(std::max<unsigned>(options.active_files, 1u)) {
     // Allocate two LSMT levels.
     files_.resize(1 + 8);
   }
@@ -666,7 +671,7 @@ class Database {
               if (mode == CompactionMode::kGather) {
                 return {0, cell};
               } else {
-                size_t i = XXH32(key.data(), key.size(), 1) % 8;
+                size_t i = XXH32(key.data(), key.size(), cell) % 8;
 
                 return {i, cell * 8 + i + 1};
               }
@@ -901,13 +906,16 @@ class Database {
     }
   }
 
-  /// @brief Writes the data to the active data file.
+  /// Writes the data to the active data file.
   ///
   /// @returns written record or an error code if the write was unseccessful.
   std::pair<Record, Status> WriteEntry(const std::string_view key, const std::string_view value,
       const uint64_t timestamp, const bool is_tombstone, const bool sync) {
-    std::unique_lock write_lock(write_mutex_, std::defer_lock);
+    ActiveFile& active_file = active_files_.size() == 1
+                                  ? active_files_[0]
+                                  : active_files_[XXH32(key.data(), key.size(), 0) % active_files_.size()];
 
+    std::unique_lock write_lock(active_file.write_mutex, std::defer_lock);
     // Target file provider.
     const auto& file_provider = [&](const uint32_t length) -> FileInfoStatus {
       // Acquire exclusive access for writing to active file.
@@ -915,28 +923,28 @@ class Database {
 
       // Check the capacity of the current active file and close it if there
       // is not enough space left for writing.
-      if (active_file_) {
-        if (active_file_->size + length > options_.max_file_size) {
-          active_file_->CloseFile(sync);
+      if (active_file.file) {
+        if (active_file.file->size + length > options_.max_file_size) {
+          active_file.file->CloseFile(sync);
 
           // Acquire exclusive access to list of data files.
           std::lock_guard file_lock(file_mutex_);
           // Move data file into the read-only set.
-          files_[0].push_back(std::move(active_file_));
+          files_[0].push_back(std::move(active_file.file));
         }
       }
 
       // Create new active file if none exists.
-      if (!bool(active_file_)) {
+      if (!bool(active_file.file)) {
         auto [file, status] = MakeWritableFile("0-" + std::to_string(++clock_) + ".dat", false);
         if (status) {
-          active_file_ = std::move(file);
+          active_file.file = std::move(file);
         } else {
           return {file, status};
         }
       }
 
-      return {active_file_, {}};
+      return {active_file.file, {}};
     };
 
     return WriteEntryToFile(key, value, timestamp, is_tombstone, sync, file_provider);
@@ -1094,6 +1102,13 @@ class Database {
   }
 
  private:
+  struct ActiveFile {
+    /// Provides exclusive access for writing to the active file.
+    std::mutex write_mutex;
+    /// A file object designated for writing.
+    std::shared_ptr<FileInfo> file;
+  };
+
   struct StringHash {
     using is_transparent = void;
 
@@ -1131,11 +1146,8 @@ class Database {
   /// A set of fine-grained locks.
   std::unordered_set<std::string_view> key_locks_;
 
-  /// Provides exclusive access for writing to active file.
-  /// The mutex must also be taken when updating the list of data files.
-  std::mutex write_mutex_;
-  /// Index of a file designated for writing.
-  std::shared_ptr<FileInfo> active_file_;
+  /// A list of active files that can be opened simultaneously.
+  std::vector<ActiveFile> active_files_;
 
   mutable std::mutex file_mutex_;
   /// Ln read-only data files.
