@@ -36,25 +36,30 @@
 namespace bitcask {
 namespace detail {
 
+// The byte size of the magic number.
 static constexpr size_t kFileMagicSize = 6;
+// The magic number for the first version of the data file format.
+static constexpr char kFileMagicV1[] = {'B', 'C', 'S', 'K', 'V', '1'};
 
 static constexpr uint16_t kFileFlagNone = 0x00;
-static constexpr uint16_t kFileFlagWithIndex = 0x01;
+static constexpr uint16_t kFileFlagWithFooter = 0x01;
 
 static constexpr uint16_t kEntryFlagTombstone = 0x01;
 
-// |------------------------------------------------------------|
-// |                The layout of the data record               |
-// |------------------------------------------------------|-----|
-// | 64 bit | 64 bit | 16 bit |16 bit  | 32 bit   | var   | var |
-// |--------|--------|--------|--------|----------|-------|-----|
-// | crc    | tstamp | flags  | key_sz | value_sz | value | key |
-// |------------------------------------------------------|-----|
-//                                                ^
-//                                       In-memory pointer.
+// |-----------------------------------------------------------|
+// |                The layout of the data record              |
+// |-----------------------------------------------------|-----|
+// | 64 bit | 64 bit | 32 bit   | 16 bit | 8 bit | var   | var |
+// |--------|--------|----------|--------|-------|-------|-----|
+// | crc    | tstamp | value_sz | key_sz | flags | value | key |
+// |-----------------------------------------------------|-----|
+//                                               ^
+//                                      In-memory pointer.
+
+#pragma pack(push, 1)
 
 struct Header {
-  /// Magic constant ('BCSK') to identify the type of the file.
+  /// Magic constant ('BCSKV1') to identify the type of the file.
   char magic[kFileMagicSize];
   /// Various flags for the data file.
   uint16_t flags;
@@ -63,12 +68,12 @@ struct Header {
 struct Entry {
   /// The update time of the record.
   uint64_t timestamp;
-  /// Various flags for the entry.
-  uint16_t flags;
-  /// The size of the record's key.
-  uint16_t key_size;
   /// The size of the record's value.
   uint32_t value_size;
+  /// The size of the record's key.
+  uint16_t key_size;
+  /// Various flags for the entry.
+  uint8_t flags;
 
   constexpr bool is_tobstone() const noexcept { return (flags & kEntryFlagTombstone) != 0; }
 };
@@ -76,15 +81,14 @@ struct Entry {
 struct Index {
   /// The update time of the record.
   uint64_t timestamp;
-  /// Various flags for the entry.
-  uint16_t flags;
-  /// The size of the record's key.
-  uint16_t key_size;
   /// The size of the record's value.
   uint32_t value_size;
-  /// The offset to the record's value from the begginning of the section with
-  /// entries.
-  uint64_t value_pos;
+  /// The offset to the record from the begginning of the file.
+  uint32_t entry_pos;
+  /// The size of the record's key.
+  uint16_t key_size;
+  /// Various flags for the entry.
+  uint8_t flags;
 };
 
 struct Footer {
@@ -96,9 +100,12 @@ struct Footer {
   uint64_t index;
 };
 
+#pragma pack(pop)
+
+static_assert(sizeof(kFileMagicV1) == kFileMagicSize);
 static_assert(sizeof(Header) == 8);
-static_assert(sizeof(Entry) == 16);
-static_assert(sizeof(Index) == 24);
+static_assert(sizeof(Entry) == 15);
+static_assert(sizeof(Index) == 19);
 static_assert(sizeof(Footer) == 16);
 
 } // namespace detail
@@ -110,6 +117,8 @@ class Status {
     kNotFound,
     /// Requested operation already in progress.
     kInProgress,
+    /// Invalid argument.
+    kInvalidArgument,
     /// IO error.
     kIOError,
     /// Inconsistent state of the database.
@@ -127,6 +136,8 @@ class Status {
 
   static constexpr Status InProgress() noexcept { return Status(Code::kInProgress); }
 
+  static constexpr Status InvalidArgument() noexcept { return Status(Code::kInvalidArgument); }
+
   static constexpr Status NotFound() noexcept { return Status(Code::kNotFound); }
 
   static constexpr Status IOError(int errnum) noexcept { return Status(Code::kIOError, errnum); }
@@ -143,6 +154,8 @@ class Status {
         return "Inconsistent";
       case Code::kInProgress:
         return "In progress";
+      case Code::kInvalidArgument:
+        return "Invalid argument";
       case Code::kIOError:
         return ::strerror(errno_);
       case Code::kReadOnly:
@@ -154,6 +167,9 @@ class Status {
  public:
   /// Returns true if the status indicates InProgress error.
   constexpr bool IsInProgress() const noexcept { return code_ == Code::kInProgress; }
+
+  /// Returns true if the status indicates InvalidArgument error.
+  constexpr bool IsInvalidArgument() const noexcept { return code_ == Code::kInvalidArgument; }
 
   /// Returns true if the status indicates a NotFound error.
   constexpr bool IsNotFound() const noexcept { return code_ == Code::kNotFound; }
@@ -175,7 +191,7 @@ class Status {
  private:
   Code code_{Code::kSuccess};
   /// System error number.
-  int errno_;
+  int errno_{0};
 };
 
 struct Options {
@@ -191,7 +207,7 @@ struct Options {
   bool read_only = false;
 
   /// Write index at the end of each merged file.
-  bool write_index = false;
+  bool write_index = true;
 };
 
 /**
@@ -239,8 +255,8 @@ class Database {
     /// File descriptor.
     int fd{-1};
 
-    /// Size of the data written so far.
-    /// The size is only updated on writing.
+    /// Total size of the file.
+    /// The size is only updated on writing or set on loading.
     std::atomic_uint64_t size{0};
 
    public:
@@ -253,9 +269,40 @@ class Database {
     }
 #endif
 
-    /// Waits for the completion of all ongoing reads and closes the file
-    /// descriptor.
-    void CloseFile(bool data_sync = false) {
+    /**
+     * Appends data to the file.
+     *
+     * @param parts scatter parts of the data to write.
+     * @param sync if true, fsync will be called after write.
+     */
+    Status Append(const std::span<const iovec>& parts, const bool sync) noexcept {
+      const size_t length = std::accumulate(
+          parts.begin(), parts.end(), 0ul, [](const auto acc, const auto& p) { return acc + p.iov_len; });
+
+      const ssize_t ret = ::writev(fd, parts.data(), parts.size());
+      // Write errors.
+      if (ret == -1) {
+        return Status::IOError(errno);
+      }
+      if (ret != length) {
+        return Status::IOError(0);
+      }
+      // Force flush of written data.
+      if (sync) {
+        ::fsync(fd);
+      }
+      // Update total size of the file.
+      size.fetch_add(length);
+
+      return {};
+    }
+
+    /**
+     * Waits for the completion of all ongoing reads and closes the file descriptor.
+     *
+     * @param sync if true, fsync will be called before the file is closed.
+     */
+    void CloseFile(bool sync = false) {
       int prev_fd = -1;
 
       {
@@ -271,14 +318,16 @@ class Database {
       }
 
       // Flush data if needed.
-      if (data_sync) {
+      if (sync) {
         ::fsync(prev_fd);
       }
       // Close the file descriptor.
       ::close(prev_fd);
     }
 
-    /// Checks file is opened otherwise opens it in read-only mode.
+    /**
+     * Checks file is opened otherwise opens it in read-only mode.
+     */
     Status EnsureReadable() {
       // Acquire exclusive access to a file descriptor to avoid opening the file
       // multiple times.
@@ -294,6 +343,15 @@ class Database {
 
       return {};
     }
+  };
+
+  struct FileSections {
+    using Range = std::pair<uint64_t, uint64_t>;
+
+    std::optional<Range> header;
+    std::optional<Range> entries;
+    std::optional<Range> index;
+    std::optional<Range> footer;
   };
 
   struct Record {
@@ -429,6 +487,12 @@ class Database {
   Status Put(const WriteOptions& options, const std::string_view key, const std::string_view value) {
     std::shared_lock op_lock(operation_mutex_);
 
+    if (key.size() > std::numeric_limits<decltype(detail::Entry::key_size)>::max()) {
+      return Status::InvalidArgument();
+    }
+    if (value.size() > std::numeric_limits<decltype(detail::Entry::value_size)>::max()) {
+      return Status::InvalidArgument();
+    }
     if (options_.read_only) {
       return Status::ReadOnly();
     }
@@ -521,7 +585,7 @@ class Database {
     return {};
   }
 
-  /// Closes current active file.
+  /// Closes current active files.
   Status Rotate() {
     std::shared_lock op_lock(operation_mutex_);
     std::vector<std::shared_ptr<FileInfo>> files;
@@ -576,10 +640,9 @@ class Database {
   }
 
   Status Initialize() {
-    std::unordered_map<std::string, uint64_t> tombstones;
+    unordered_string_map<uint64_t> tombstones;
 
-    const auto cb = [&](const Record& record, const bool is_tombstone, std::string key,
-                        std::string value) -> Status {
+    const auto cb = [&](const Record& record, const bool is_tombstone, std::string_view key) -> Status {
       clock_ = std::max<uint64_t>(clock_, record.timestamp);
 
       const auto ti = tombstones.find(key);
@@ -614,6 +677,23 @@ class Database {
       return {};
     };
 
+    const auto enumerate_keys = [this](const auto& file, const auto& cb) {
+      FileSections sections;
+
+      if (auto s = LoadFileSections(file, &sections); !s) {
+        return s;
+      }
+
+      if (sections.index) {
+        return EnumerateIndex(file, sections.index.value(), cb);
+      } else {
+        return EnumerateEntries(file, sections.entries.value(),
+            [&](const Record& record, const bool is_tombstone, std::string_view key, std::string_view) {
+              return cb(record, is_tombstone, key);
+            });
+      }
+    };
+
     for (const auto& entry : std::filesystem::directory_iterator(base_path_)) {
       if (!entry.is_regular_file()) {
         continue;
@@ -630,8 +710,8 @@ class Database {
         return s;
       }
       [[maybe_unused]] Defer do_close([file]() { file->CloseFile(); });
-      // Read entries from the file.
-      if (auto s = EnumerateEntriesNoLock(file, cb); !s) {
+      // Read keys from the file.
+      if (auto s = enumerate_keys(file, cb); !s) {
         if (s.IsNotFound()) {
           continue;
         }
@@ -652,8 +732,8 @@ class Database {
 
     static_assert(std::is_trivially_destructible_v<decltype(updates)::value_type>);
 
-    const auto cb = [&](const Record& record, const bool is_tombstone, std::string key,
-                        std::string value) -> Status {
+    const auto cb = [&](const Record& record, const bool is_tombstone, const std::string_view key,
+                        const std::string_view value) -> Status {
       auto ki = keys_.find(key);
       if (ki == keys_.end()) {
         if (mode == CompactionMode::kGather && cell > 0) {
@@ -678,8 +758,8 @@ class Database {
             }();
 
             if (output[i].empty() || output[i].back()->size + length > options_.max_file_size) {
-              auto [file, status] =
-                  MakeWritableFile(std::to_string(index) + "-" + std::to_string(++clock_) + ".dat", false);
+              auto [file, status] = MakeWritableFile(
+                  std::to_string(index) + "-" + std::to_string(++clock_) + ".dat", options_.write_index);
               if (!status) {
                 return {{}, status};
               }
@@ -725,12 +805,19 @@ class Database {
       updates.clear();
     }
 
-    // Close output files.
-    // Ensure all data was written to the storage device
-    // before the source files will be deleted.
+    // Finalize output files.
     for (const auto& f : output) {
-      std::for_each(f.begin(), f.end(), [](auto& f) { f->CloseFile(true); });
+      std::for_each(f.begin(), f.end(), [this](auto& f) {
+        // Append index at the end of file.
+        if (options_.write_index) {
+          WriteIndex(f);
+        }
+        // Ensure all data was written to the storage device
+        // before the source files will be deleted.
+        f->CloseFile(true);
+      });
     }
+
     // Cleanup processed files.
     for (const auto& file : files) {
       assert(file.use_count() == 1);
@@ -810,31 +897,62 @@ class Database {
   }
 
  private:
-  Status EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
-      const std::function<Status(const Record&, const bool, std::string, std::string)>& cb) const {
-    size_t offset = 0;
-    uint64_t file_size = file->size;
-    detail::Header header;
+  Status EnumerateIndex(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
+      const std::function<Status(const Record&, const bool, std::string_view)>& cb) const {
+    const auto fd = file->fd;
+    std::string key;
 
-    if (auto s = LoadFromFile(file->fd, &header, sizeof(header), offset); !s) {
-      return s;
-    } else if (std::memcmp(header.magic, "BCSKV1", detail::kFileMagicSize) != 0) {
-      return Status::NotFound();
-    }
-
-    if (header.flags & detail::kFileFlagWithIndex) {
-      detail::Footer footer;
-      size_t footer_offset = file->size - sizeof(footer);
-      if (auto s = LoadFromFile(file->fd, &footer, sizeof(footer), footer_offset); !s) {
-        return s;
+    for (size_t offset = range.first, end = range.second; offset < end;) {
+      uint64_t crc;
+      detail::Index index;
+      Status status;
+      // Load crc.
+      if (!(status = LoadFromFile(fd, &crc, sizeof(crc), offset))) {
+        return status;
       }
-      file_size = footer.index;
+      // Load entry.
+      if (!(status = LoadFromFile(fd, &index, sizeof(index), offset))) {
+        return status;
+      }
+      key.resize(index.key_size);
+      // Load key.
+      if (!(status = LoadFromFile(fd, key.data(), key.size(), offset))) {
+        return status;
+      }
+      // Check crc.
+      const std::array parts{
+          iovec{.iov_base = &index, .iov_len = sizeof(index)},
+          iovec{.iov_base = key.data(), .iov_len = key.size()},
+      };
+      if (Hash64(std::span(parts)) != crc) {
+        return Status::Inconsistent();
+      }
+
+      const Record record{
+          .file = file.get(),
+          .timestamp = index.timestamp,
+          .offset = uint32_t(index.entry_pos + sizeof(uint64_t) + sizeof(detail::Entry)),
+          .size = index.value_size,
+      };
+
+      if (!(status = cb(record, index.flags & detail::kEntryFlagTombstone, key))) {
+        return status;
+      }
     }
 
-    while (offset < file_size) {
+    return {};
+  }
+
+  Status EnumerateEntries(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
+      const std::function<Status(const Record&, const bool, std::string_view, std::string_view)>& cb)
+      const {
+    const auto fd = file->fd;
+    std::string key;
+    std::string value;
+
+    for (size_t offset = range.first, end = range.second; offset < end;) {
       detail::Entry e;
-      std::string key;
-      std::string value;
+
       auto [read, status] = ReadEntryImpl(file->fd, offset, false, e, key, value);
       if (!status) {
         return status;
@@ -847,7 +965,7 @@ class Database {
           .size = uint32_t(value.size()),
       };
 
-      auto s = cb(record, (e.flags & detail::kEntryFlagTombstone), std::move(key), std::move(value));
+      auto s = cb(record, (e.flags & detail::kEntryFlagTombstone), key, value);
       if (!s) {
         return s;
       }
@@ -858,7 +976,27 @@ class Database {
     return {};
   }
 
-  FileInfoStatus MakeWritableFile(const std::string& name, bool with_index) const {
+  Status EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
+      const std::function<Status(const Record&, const bool, std::string_view, std::string_view)>& cb)
+      const {
+    FileSections sections;
+
+    if (auto s = LoadFileSections(file, &sections); !s) {
+      return s;
+    }
+
+    return EnumerateEntries(file, sections.entries.value(), cb);
+  }
+
+  /**
+   * Creates a writable file object.
+   *
+   * @param name name of the data file.
+   * @param with_footer set the flag signaling of footer's presence at the end of the file.
+   *
+   * @returns a writable file object or an error status code.
+   */
+  FileInfoStatus MakeWritableFile(const std::string& name, bool with_footer) const {
     static constexpr std::filesystem::perms kDefaultPremissions =
         std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
         std::filesystem::perms::group_read | std::filesystem::perms::others_read;
@@ -870,7 +1008,7 @@ class Database {
       return {{}, Status::IOError(errno)};
     } else {
       const detail::Header header{.magic = {'B', 'C', 'S', 'K', 'V', '1'},
-          .flags = with_index ? detail::kFileFlagWithIndex : detail::kFileFlagNone};
+          .flags = with_footer ? detail::kFileFlagWithFooter : detail::kFileFlagNone};
 
       if (::write(fd, &header, sizeof(header)) == -1) {
         int err = errno;
@@ -917,14 +1055,24 @@ class Database {
 
     std::unique_lock write_lock(active_file.write_mutex, std::defer_lock);
     // Target file provider.
-    const auto& file_provider = [&](const uint32_t length) -> FileInfoStatus {
+    const auto& file_provider = [&](const uint64_t length) -> FileInfoStatus {
       // Acquire exclusive access for writing to active file.
       write_lock.lock();
+
+      const auto is_capacity_exceeded = [this](const auto current_size, const auto length) {
+        static constinit auto kMaxEntryOffset = std::numeric_limits<decltype(Record::offset)>::max();
+
+        return
+            // Ensure that the offset of the value does not overflow.
+            (current_size + (sizeof(uint64_t) + sizeof(detail::Entry)) > kMaxEntryOffset) ||
+            // Ensure that the limit of the file size will not be exceeded.
+            (current_size + length > options_.max_file_size);
+      };
 
       // Check the capacity of the current active file and close it if there
       // is not enough space left for writing.
       if (active_file.file) {
-        if (active_file.file->size + length > options_.max_file_size) {
+        if (is_capacity_exceeded(active_file.file->size.load(), length)) {
           active_file.file->CloseFile(sync);
 
           // Acquire exclusive access to list of data files.
@@ -950,12 +1098,46 @@ class Database {
     return WriteEntryToFile(key, value, timestamp, is_tombstone, sync, file_provider);
   }
 
+  Status WriteIndex(const std::shared_ptr<FileInfo>& file) {
+    const auto cb = [&](const Record& rec, const bool is_tombstone, const std::string_view key,
+                        const std::string_view) -> Status {
+      uint64_t crc;
+      const detail::Index index{
+          .timestamp = rec.timestamp,
+          .value_size = rec.size,
+          .entry_pos = uint32_t(rec.offset - (sizeof(uint64_t) + sizeof(detail::Entry))),
+          .key_size = uint16_t(key.size()),
+          .flags = uint8_t(is_tombstone ? detail::kEntryFlagTombstone : 0),
+      };
+
+      const std::array parts = {
+          iovec{.iov_base = &crc, .iov_len = sizeof(crc)},
+          iovec{.iov_base = (void*)&index, .iov_len = sizeof(index)},
+          iovec{.iov_base = (void*)key.data(), .iov_len = key.size()},
+      };
+
+      crc = Hash64(std::span(parts).subspan<1>());
+
+      return file->Append(parts, false);
+    };
+
+    detail::Footer footer{.entries = sizeof(detail::Header), .index = file->size.load()};
+    // Write index entries.
+    auto s = EnumerateEntries(file, std::make_pair(sizeof(detail::Header), file->size.load()), cb);
+    if (!s) {
+      return s;
+    }
+    // Write footer.
+    return file->Append(std::array{iovec{.iov_base = &footer, .iov_len = sizeof(footer)}}, false);
+  }
+
  private:
-  static uint64_t CalculateCrc(const std::span<const iovec, 3>& parts) noexcept {
+  template <size_t N>
+  static uint64_t Hash64(const std::span<const iovec, N>& parts) noexcept {
     std::unique_ptr<XXH64_state_t, std::function<void(XXH64_state_t*)>> state(
-        //
+        // Create state.
         XXH64_createState(),
-        //
+        // State destructor.
         [](XXH64_state_t* state) { XXH64_freeState(state); });
 
     XXH64_reset(state.get(), 0);
@@ -980,6 +1162,38 @@ class Database {
         len -= ret;
         off += ret;
       }
+    }
+
+    return {};
+  }
+
+  static Status LoadFileSections(const std::shared_ptr<FileInfo>& file, FileSections* sections) {
+    detail::Header header;
+    size_t offset = 0;
+    // Load header.
+    if (auto s = LoadFromFile(file->fd, &header, sizeof(header), offset); !s) {
+      return s;
+    } else if (std::memcmp(header.magic, detail::kFileMagicV1, detail::kFileMagicSize) != 0) {
+      return Status::NotFound();
+    }
+    // Load footer.
+    if (header.flags & detail::kFileFlagWithFooter) {
+      detail::Footer footer;
+      size_t footer_offset = file->size - sizeof(footer);
+      if (auto s = LoadFromFile(file->fd, &footer, sizeof(footer), footer_offset); !s) {
+        return s;
+      }
+      if (footer.entries > footer.index) {
+        return Status::Inconsistent();
+      }
+
+      sections->header = std::pair{0, sizeof(header)};
+      sections->entries = std::pair{footer.entries, footer.index};
+      sections->index = std::pair{footer.index, file->size - sizeof(footer)};
+      sections->footer = std::pair{file->size - sizeof(footer), file->size.load()};
+    } else {
+      sections->header = std::pair{0, sizeof(header)};
+      sections->entries = std::pair{sizeof(header), file->size.load()};
     }
 
     return {};
@@ -1035,7 +1249,7 @@ class Database {
           iovec{.iov_base = key.data(), .iov_len = key.size()},
       };
 
-      if (CalculateCrc(parts) != crc) {
+      if (Hash64(std::span(parts)) != crc) {
         return {{}, Status::Inconsistent()};
       }
     }
@@ -1046,18 +1260,16 @@ class Database {
   /// @brief Writes record to the data file provided by \p cb
   static std::pair<Record, Status> WriteEntryToFile(const std::string_view key,
       const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync,
-      const std::function<FileInfoStatus(size_t)>& cb) {
+      const std::function<FileInfoStatus(uint64_t)>& cb) {
     assert(!is_tombstone || value.empty());
 
     uint64_t crc;
-    // Total size of data to write.
-    const size_t length = sizeof(uint64_t) + sizeof(detail::Entry) + key.size() + value.size();
     // Fill entry.
     const detail::Entry entry{
         .timestamp = timestamp,
-        .flags = uint16_t(is_tombstone ? detail::kEntryFlagTombstone : 0x00),
-        .key_size = uint16_t(key.size()),
         .value_size = uint32_t(value.size()),
+        .key_size = uint16_t(key.size()),
+        .flags = uint8_t(is_tombstone ? detail::kEntryFlagTombstone : 0x00),
     };
     // Make parts.
     const std::array parts = {
@@ -1066,8 +1278,11 @@ class Database {
         iovec{.iov_base = (void*)value.data(), .iov_len = value.size()},
         iovec{.iov_base = (void*)key.data(), .iov_len = key.size()},
     };
+    // Total size of data to write.
+    const uint64_t length = std::accumulate(
+        parts.begin(), parts.end(), 0ull, [](const auto acc, const auto& p) { return acc + p.iov_len; });
     // Calculate crc.
-    crc = CalculateCrc(std::span(parts).subspan<1>());
+    crc = Hash64(std::span(parts).subspan<1>());
 
     const auto [file, status] = cb(length);
     if (!status) {
@@ -1075,23 +1290,12 @@ class Database {
     }
     // Offset at which new entry will be written.
     const uint64_t offset = file->size;
-
-    const ssize_t ret = ::writev(file->fd, (struct iovec*)parts.data(), parts.size());
-
-    if (ret == -1) {
-      return {{}, Status::IOError(errno)};
+    // Write data to the file.
+    if (auto status = file->Append(parts, sync); !status) {
+      return {{}, status};
     }
-    if (ret != length) {
-      return {{}, Status::IOError(0)};
-    }
-    // Force flush of written data.
-    if (sync) {
-      ::fsync(file->fd);
-    }
-    // Update size of written data.
-    file->size.fetch_add(length);
 
-    auto record = Record{
+    const Record record{
         .file = file.get(),
         .timestamp = timestamp,
         .offset = uint32_t(offset + sizeof(uint64_t) + sizeof(detail::Entry)),
