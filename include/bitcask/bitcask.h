@@ -177,8 +177,11 @@ class Status {
   /// Returns true if the status indicates success.
   constexpr bool IsSuccess() const noexcept { return code_ == Code::kSuccess; }
 
-  /// Returns true if the status indicates IO error.
+  /// Returns true if the status indicates an IO error.
   constexpr bool IsIOError() const noexcept { return code_ == Code::kIOError; }
+
+  /// Returns true if the status indicates an IO error due to too many open files.
+  constexpr bool IsTooManyOpenFiles() const noexcept { return code_ == Code::kIOError && errno_ == EMFILE; }
 
   /// Returns true if the status indicates read-only mode.
   constexpr bool IsReadOnly() const noexcept { return code_ == Code::kReadOnly; }
@@ -301,8 +304,10 @@ class Database {
      * Waits for the completion of all ongoing reads and closes the file descriptor.
      *
      * @param sync if true, fsync will be called before the file is closed.
+     *
+     * @returns true if the file descriptor is valid and has been closed; otherwise, it returns false.
      */
-    void CloseFile(bool sync = false) {
+    bool CloseFile(bool sync = false) {
       int prev_fd = -1;
 
       {
@@ -311,7 +316,10 @@ class Database {
         // Acquire exclusive access to file descriptor.
         std::lock_guard fd_lock(fd_mutex);
 
-        assert(fd != -1);
+        // Check file is opened.
+        if (fd == -1) {
+          return false;
+        }
         // After resetting the file descriptor, a concurrent thread can open the
         // file for reading.
         std::swap(fd, prev_fd);
@@ -323,6 +331,8 @@ class Database {
       }
       // Close the file descriptor.
       ::close(prev_fd);
+
+      return true;
     }
 
     /**
@@ -372,17 +382,15 @@ class Database {
 
  public:
   ~Database() {
+    // Close writable files.
     for (const auto& item : active_files_) {
       if (item.file) {
         item.file->CloseFile(options_.data_sync);
       }
     }
+    // Close read-only files.
     for (const auto& parts : files_) {
-      std::for_each(parts.begin(), parts.end(), [this](const auto& f) {
-        if (f->fd != -1) {
-          f->CloseFile(options_.data_sync);
-        }
-      });
+      std::for_each(parts.begin(), parts.end(), [this](const auto& f) { f->CloseFile(); });
     }
   }
 
@@ -521,6 +529,17 @@ class Database {
   }
 
  public:
+  /**
+   * Closes all opened read-only files.
+   */
+  void CloseFiles() {
+    std::lock_guard file_lock(file_mutex_);
+
+    for (const auto& parts : files_) {
+      std::for_each(parts.begin(), parts.end(), [this](const auto& f) { f->CloseFile(); });
+    }
+  }
+
   Status Pack(bool force = false) {
     for (int cell = 0; true; cell++) {
       std::vector<std::shared_ptr<FileInfo>> files;

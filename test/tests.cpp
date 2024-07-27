@@ -7,6 +7,10 @@
 #include "catch.hpp"
 #include "temp_directory.h"
 
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
+
 namespace {
 
 constexpr bitcask::Options kDefaultOptions{
@@ -268,3 +272,40 @@ TEST_CASE("Write single key by multiple threads") {
   auto s = db->Get({}, "abc", &tmp);
   CHECK((s.IsNotFound() || (s.IsSuccess() && tmp == value)));
 }
+
+#ifdef __linux__
+TEST_CASE("Limit of opened files") {
+  TemporaryDirectory temp_dir;
+  std::unique_ptr<bitcask::Database> db;
+
+  REQUIRE(bitcask::Database::Open({.max_file_size = 4 << 10}, temp_dir.GetPath(), db));
+
+  std::string s;
+  s.resize(1024);
+  for (size_t i = 0; i < s.size(); ++i) {
+    s[i] = i % 256;
+  }
+  for (size_t i = 0; i < 4 * 16; ++i) {
+    db->Put({}, std::to_string(i), s);
+  }
+
+  db->Rotate();
+
+  rlimit limits{.rlim_cur = 16, .rlim_max = 16};
+  CHECK(::setrlimit(RLIMIT_NOFILE, &limits) != -1);
+
+  for (size_t i = 0; i < 4 * 16;) {
+    std::string tmp;
+    auto status = db->Get({}, std::to_string(i), &tmp);
+    if (status.IsTooManyOpenFiles()) {
+      db->CloseFiles();
+    } else {
+      INFO(status.Message());
+      REQUIRE(status);
+      CHECK(tmp == s);
+      ++i;
+    }
+  }
+}
+
+#endif
