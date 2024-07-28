@@ -201,6 +201,8 @@ struct Options {
   /// Number of active files.
   uint8_t active_files = 1;
 
+  uint8_t compaction_levels = 2;
+
   uint32_t max_file_size = std::numeric_limits<uint32_t>::max();
 
   /// Flush in-core data to storage device after write.
@@ -543,7 +545,7 @@ class Database {
   Status Pack(bool force = false) {
     for (size_t i = 0; i != compaction_slots_count_; ++i) {
       std::vector<std::shared_ptr<FileInfo>> files;
-      CompactionMode mode = CompactionMode::kScatter;
+      CompactionMode mode;
 
       {
         std::unique_lock op_lock(operation_mutex_);
@@ -554,22 +556,38 @@ class Database {
         }
 
         std::lock_guard file_lock(file_mutex_);
-        // Stop if all portions were processed.
-        if (i >= files_.size()) {
+        // No more slots to process. Done.
+        if (i == files_.size()) {
           return {};
-        } else if (i > 0) {
+        }
+        // Check if there is something to process.
+        if (files_[i].empty()) {
+          continue;
+        }
+        if (i == 0) {
+          mode = CompactionMode::kScatter;
+        } else if (IsLastCompactionLevel(i)) {
           if (!force && files_[i].size() < 4) {
             continue;
           }
+          mode = CompactionMode::kGather;
+        } else {
+          // Total size of the files in the slot.
+          const size_t total_size = std::accumulate(files_[i].begin(), files_[i].end(), 0ull,
+              [](const auto acc, const auto& f) { return acc + f->size; });
+
+          if (total_size > options_.max_file_size) {
+            mode = CompactionMode::kScatter;
+          } else {
+            if (!force && files_[i].size() < 4) {
+              continue;
+            }
+            mode = CompactionMode::kGather;
+          }
         }
+
         // Grab all accumulated files for processing.
         files.swap(files_[i]);
-        // Check if there is something to process.
-        if (files.empty()) {
-          continue;
-        }
-        // Choose compation mode.
-        mode = (i == 0) ? CompactionMode::kScatter : CompactionMode::kGather;
 
         // Create a key-set for buffering updates during the merge.
         updated_keys_ = std::make_unique<unordered_string_map<Record>>();
@@ -668,11 +686,20 @@ class Database {
 
   Database(const Options& options, const std::filesystem::path& path)
       : options_(options), base_path_(path), active_files_(std::max<unsigned>(1u, options.active_files)) {
+    // Adjust number of compactions levels.
+    options_.compaction_levels = std::max<unsigned>(1u, options_.compaction_levels);
     // Calculate number of slots for an LSM-tree with up to 8 nodes per level, starting with the second.
-    compaction_slots_count_ = ((1ull << (3 * (/* compaction_levels */ 2 + 1))) - 1) / 7;
+    compaction_slots_count_ = ((1ull << (3 * (options_.compaction_levels + 1))) - 1) / 7;
 
     // Allocate compaction slots.
     files_.resize(compaction_slots_count_);
+
+    compaction_levels_.resize(options_.compaction_levels + 1);
+    // Fill ranges of compaction levels.
+    for (int i = 1, end = options_.compaction_levels + 1; i != end; ++i) {
+      compaction_levels_[i].first = (compaction_levels_[i - 1].first * 8) + 1;
+      compaction_levels_[i].second = (compaction_levels_[i - 1].second + 1) * 8;
+    }
   }
 
   Status Initialize() {
@@ -764,6 +791,10 @@ class Database {
     return {};
   }
 
+  bool IsLastCompactionLevel(const size_t i) const noexcept {
+    return i >= compaction_levels_.back().first && i <= compaction_levels_.back().second;
+  };
+
   Status PackFiles(
       const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int slot) {
     std::vector<std::vector<std::shared_ptr<FileInfo>>> output(8);
@@ -776,7 +807,8 @@ class Database {
       auto ki = keys_.find(key);
       if (ki == keys_.end()) {
         if (is_tombstone) {
-          if (mode == CompactionMode::kGather && slot > 0) {
+          if (IsLastCompactionLevel(slot)) {
+            assert(mode == CompactionMode::kGather);
             return {};
           }
         } else {
@@ -801,7 +833,7 @@ class Database {
 
             if (mode == CompactionMode::kScatter) {
               i = XXH64(key.data(), key.size(), slot + 1) % 8;
-              index = slot * 8 + i + 1;
+              index = (slot * 8 + 1) + i;
             }
 
             if (output[i].empty() || IsCapacityExceeded(output[i].back()->size, length)) {
@@ -1401,6 +1433,8 @@ class Database {
 
   /// The maximum number of LSMT slots available.
   size_t compaction_slots_count_{1};
+  /// Ranges of compaction levels.
+  std::vector<std::pair<size_t, size_t>> compaction_levels_;
 
   mutable std::mutex file_mutex_;
   /// Ln read-only data files.
