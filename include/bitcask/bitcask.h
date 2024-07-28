@@ -541,7 +541,7 @@ class Database {
   }
 
   Status Pack(bool force = false) {
-    for (int cell = 0; true; cell++) {
+    for (size_t i = 0; i != compaction_slots_count_; ++i) {
       std::vector<std::shared_ptr<FileInfo>> files;
       CompactionMode mode = CompactionMode::kScatter;
 
@@ -555,27 +555,27 @@ class Database {
 
         std::lock_guard file_lock(file_mutex_);
         // Stop if all portions were processed.
-        if (cell >= files_.size()) {
+        if (i >= files_.size()) {
           return {};
-        } else if (cell > 0) {
-          if (!force && files_[cell].size() < 4) {
+        } else if (i > 0) {
+          if (!force && files_[i].size() < 4) {
             continue;
           }
         }
         // Grab all accumulated files for processing.
-        files.swap(files_[cell]);
+        files.swap(files_[i]);
         // Check if there is something to process.
         if (files.empty()) {
           continue;
         }
         // Choose compation mode.
-        mode = (cell == 0) ? CompactionMode::kScatter : CompactionMode::kGather;
+        mode = (i == 0) ? CompactionMode::kScatter : CompactionMode::kGather;
 
         // Create a key-set for buffering updates during the merge.
         updated_keys_ = std::make_unique<unordered_string_map<Record>>();
       }
 
-      auto status = PackFiles(std::move(files), mode, cell);
+      auto status = PackFiles(files, mode, i);
 
       {
         std::unique_lock op_lock(operation_mutex_);
@@ -596,7 +596,21 @@ class Database {
         updated_keys_.reset();
       }
 
-      if (!status) {
+      if (status) {
+        // Cleanup processed files.
+        for (const auto& file : files) {
+          assert(file.use_count() == 1);
+
+          file->CloseFile();
+          // Remove processed file from the storage device.
+          std::filesystem::remove(file->path);
+        }
+      } else {
+        std::lock_guard file_lock(file_mutex_);
+
+        files_[i].insert(
+            files_[i].end(), std::make_move_iterator(files.begin()), std::make_move_iterator(files.end()));
+
         return status;
       }
     }
@@ -653,9 +667,12 @@ class Database {
   };
 
   Database(const Options& options, const std::filesystem::path& path)
-      : options_(options), base_path_(path), active_files_(std::max<unsigned>(options.active_files, 1u)) {
-    // Allocate two LSMT levels.
-    files_.resize(1 + 8);
+      : options_(options), base_path_(path), active_files_(std::max<unsigned>(1u, options.active_files)) {
+    // Calculate number of slots for an LSM-tree with up to 8 nodes per level, starting with the second.
+    compaction_slots_count_ = ((1ull << (3 * (/* compaction_levels */ 2 + 1))) - 1) / 7;
+
+    // Allocate compaction slots.
+    files_.resize(compaction_slots_count_);
   }
 
   Status Initialize() {
@@ -738,14 +755,17 @@ class Database {
       }
 
       // Move data file into the read-only set.
-      files_.resize(std::max<size_t>(files_.size(), index.value() + 1));
-      files_[index.value()].push_back(std::move(file));
+      if (index.value() >= compaction_slots_count_) {
+        files_[0].push_back(std::move(file));
+      } else {
+        files_[index.value()].push_back(std::move(file));
+      }
     }
     return {};
   }
 
   Status PackFiles(
-      const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int cell) {
+      const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int slot) {
     std::vector<std::vector<std::shared_ptr<FileInfo>>> output(8);
     std::vector<std::pair<decltype(keys_)::iterator, Record>> updates;
 
@@ -755,10 +775,20 @@ class Database {
                         const std::string_view value) -> Status {
       auto ki = keys_.find(key);
       if (ki == keys_.end()) {
-        if (mode == CompactionMode::kGather && cell > 0) {
+        if (is_tombstone) {
+          if (mode == CompactionMode::kGather && slot > 0) {
+            return {};
+          }
+        } else {
+          // Old key that has already been deleted. Do not retain.
           return {};
         }
-      } else if (ki->second.timestamp != record.timestamp) {
+      } else if (ki->second.timestamp == record.timestamp) {
+        // The current value or potential data duplication. Keep only the current one.
+        if (ki->second.file != record.file || ki->second.offset != record.offset) {
+          return {};
+        }
+      } else {
         assert(ki->second.timestamp > record.timestamp);
         return {};
       }
@@ -768,11 +798,11 @@ class Database {
           [&](const size_t length) -> FileInfoStatus {
             const auto& [i, index] = [&]() -> std::tuple<int, int> {
               if (mode == CompactionMode::kGather) {
-                return {0, cell};
+                return {0, slot};
               } else {
-                size_t i = XXH32(key.data(), key.size(), cell) % 8;
+                size_t i = XXH64(key.data(), key.size(), slot + 1) % 8;
 
-                return {i, cell * 8 + i + 1};
+                return {i, slot * 8 + i + 1};
               }
             }();
 
@@ -797,9 +827,9 @@ class Database {
       return {};
     };
 
+    // 1. Process input files.
     for (const auto& file : files) {
-      // Acquiring read lock to prevent closing the file handle during the
-      // read.
+      // Acquiring read lock to prevent closing the file handle during the read.
       std::shared_lock read_lock(file->read_mutex);
 
       // Ensure source file is opened.
@@ -812,46 +842,36 @@ class Database {
         // TODO: finalize.
         return s;
       }
-
-      {
-        std::lock_guard key_lock(key_mutex_);
-        // Assign new location for the entries read from the current file.
-        for (const auto& [ki, record] : updates) {
-          ki->second = record;
-        }
-      }
-
-      updates.clear();
     }
 
-    // Finalize output files.
-    for (const auto& f : output) {
+    // 2. Finalize output files.
+    for (size_t i = 0, end = output.size(); i != end; ++i) {
+      const auto& f = output[i];
+
       std::for_each(f.begin(), f.end(), [this](auto& f) {
         // Append index at the end of file.
         if (options_.write_index) {
-          WriteIndex(f);
+          WriteIndex(f); // TODO: handle errors.
         }
-        // Ensure all data was written to the storage device
-        // before the source files will be deleted.
+        // Ensure that all data has been written to the storage device
+        // before deleting the source files.
         f->CloseFile(true);
       });
     }
 
-    // Cleanup processed files.
-    for (const auto& file : files) {
-      assert(file.use_count() == 1);
+    // 3. Assign new location for the entries read from the input files.
+    if (updates.size()) {
+      std::lock_guard key_lock(key_mutex_);
 
-      file->CloseFile();
-      // Remove processed file from the storage device.
-      std::filesystem::remove(file->path);
+      for (const auto& [ki, record] : updates) {
+        ki->second = record;
+      }
     }
 
-    {
-      std::lock_guard file_lock(file_mutex_);
-
-      for (size_t i = 0, end = output.size(); i != end; ++i) {
-        files_[1 + i].insert(files_[1 + i].end(), output[i].begin(), output[i].end());
-      }
+    std::lock_guard file_lock(file_mutex_);
+    // 4. Append output files to LSM-tree.
+    for (size_t i = 0, end = output.size(); i != end; ++i) {
+      files_[1 + i].insert(files_[1 + i].end(), output[i].begin(), output[i].end());
     }
 
     return {};
@@ -1070,7 +1090,7 @@ class Database {
       const uint64_t timestamp, const bool is_tombstone, const bool sync) {
     ActiveFile& active_file = active_files_.size() == 1
                                   ? active_files_[0]
-                                  : active_files_[XXH32(key.data(), key.size(), 0) % active_files_.size()];
+                                  : active_files_[XXH64(key.data(), key.size(), 0) % active_files_.size()];
 
     std::unique_lock write_lock(active_file.write_mutex, std::defer_lock);
     // Target file provider.
@@ -1371,6 +1391,9 @@ class Database {
 
   /// A list of active files that can be opened simultaneously.
   std::vector<ActiveFile> active_files_;
+
+  /// The maximum number of LSMT slots available.
+  size_t compaction_slots_count_{1};
 
   mutable std::mutex file_mutex_;
   /// Ln read-only data files.
