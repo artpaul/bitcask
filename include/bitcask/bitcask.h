@@ -81,10 +81,10 @@ struct Entry {
 struct Index {
   /// The update time of the record.
   uint64_t timestamp;
+  /// The offset to the record from the begginning of the file.
+  uint64_t entry_pos;
   /// The size of the record's value.
   uint32_t value_size;
-  /// The offset to the record from the begginning of the file.
-  uint32_t entry_pos;
   /// The size of the record's key.
   uint16_t key_size;
   /// Various flags for the entry.
@@ -105,7 +105,7 @@ struct Footer {
 static_assert(sizeof(kFileMagicV1) == kFileMagicSize);
 static_assert(sizeof(Header) == 8);
 static_assert(sizeof(Entry) == 15);
-static_assert(sizeof(Index) == 19);
+static_assert(sizeof(Index) == 23);
 static_assert(sizeof(Footer) == 16);
 
 } // namespace detail
@@ -1123,8 +1123,8 @@ class Database {
       uint64_t crc;
       const detail::Index index{
           .timestamp = rec.timestamp,
-          .value_size = rec.size,
           .entry_pos = uint32_t(rec.offset - (sizeof(uint64_t) + sizeof(detail::Entry))),
+          .value_size = rec.size,
           .key_size = uint16_t(key.size()),
           .flags = uint8_t(is_tombstone ? detail::kEntryFlagTombstone : 0),
       };
