@@ -795,18 +795,16 @@ class Database {
 
       const auto [rec, status] = WriteEntryToFile(key, value, record.timestamp, is_tombstone, false,
           // Target file provider.
-          [&](const size_t length) -> FileInfoStatus {
-            const auto& [i, index] = [&]() -> std::tuple<int, int> {
-              if (mode == CompactionMode::kGather) {
-                return {0, slot};
-              } else {
-                size_t i = XXH64(key.data(), key.size(), slot + 1) % 8;
+          [&](const uint64_t length) -> FileInfoStatus {
+            size_t i = 0;
+            size_t index = slot;
 
-                return {i, slot * 8 + i + 1};
-              }
-            }();
+            if (mode == CompactionMode::kScatter) {
+              i = XXH64(key.data(), key.size(), slot + 1) % 8;
+              index = slot * 8 + i + 1;
+            }
 
-            if (output[i].empty() || output[i].back()->size + length > options_.max_file_size) {
+            if (output[i].empty() || IsCapacityExceeded(output[i].back()->size, length)) {
               auto [file, status] = MakeWritableFile(
                   std::to_string(index) + "-" + std::to_string(++clock_) + ".dat", options_.write_index);
               if (!status) {
@@ -1028,6 +1026,23 @@ class Database {
   }
 
   /**
+   * Checks whether the appending block would exceed the file's capacity.
+   *
+   * @param current_size current size of a file.
+   * @param length length of the block to be appended.
+   * @returns true if the block exceeds capacity, false otherwise.
+   */
+  bool IsCapacityExceeded(const uint64_t current_size, const uint64_t length) const noexcept {
+    static constinit auto kMaxEntryOffset = std::numeric_limits<decltype(Record::offset)>::max();
+
+    return
+        // Ensure that the offset of the value does not overflow.
+        (current_size + (sizeof(uint64_t) + sizeof(detail::Entry)) > kMaxEntryOffset) ||
+        // Ensure that the limit of the file size will not be exceeded.
+        (current_size + length > options_.max_file_size);
+  }
+
+  /**
    * Creates a writable file object.
    *
    * @param name name of the data file.
@@ -1083,9 +1098,11 @@ class Database {
     }
   }
 
-  /// Writes the data to the active data file.
-  ///
-  /// @returns written record or an error code if the write was unseccessful.
+  /**
+   * Writes the data to the active data file.
+   *
+   * @returns written record or an error code if the write was unseccessful.
+   */
   std::pair<Record, Status> WriteEntry(const std::string_view key, const std::string_view value,
       const uint64_t timestamp, const bool is_tombstone, const bool sync) {
     ActiveFile& active_file = active_files_.size() == 1
@@ -1094,24 +1111,14 @@ class Database {
 
     std::unique_lock write_lock(active_file.write_mutex, std::defer_lock);
     // Target file provider.
-    const auto& file_provider = [&](const uint64_t length) -> FileInfoStatus {
+    const auto file_provider = [&](const uint64_t length) -> FileInfoStatus {
       // Acquire exclusive access for writing to active file.
       write_lock.lock();
-
-      const auto is_capacity_exceeded = [this](const auto current_size, const auto length) {
-        static constinit auto kMaxEntryOffset = std::numeric_limits<decltype(Record::offset)>::max();
-
-        return
-            // Ensure that the offset of the value does not overflow.
-            (current_size + (sizeof(uint64_t) + sizeof(detail::Entry)) > kMaxEntryOffset) ||
-            // Ensure that the limit of the file size will not be exceeded.
-            (current_size + length > options_.max_file_size);
-      };
 
       // Check the capacity of the current active file and close it if there
       // is not enough space left for writing.
       if (active_file.file) {
-        if (is_capacity_exceeded(active_file.file->size.load(), length)) {
+        if (IsCapacityExceeded(active_file.file->size, length)) {
           active_file.file->CloseFile(sync);
 
           // Acquire exclusive access to list of data files.
