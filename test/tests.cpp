@@ -14,6 +14,7 @@
 namespace {
 
 constexpr bitcask::Options kDefaultOptions{
+    .compaction_levels = 1,
     .max_file_size = 32ull << 20,
 };
 
