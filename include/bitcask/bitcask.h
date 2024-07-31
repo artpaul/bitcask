@@ -53,8 +53,6 @@ static constexpr uint16_t kEntryFlagTombstone = 0x01;
 // |--------|--------|----------|--------|-------|-------|-----|
 // | crc    | tstamp | value_sz | key_sz | flags | value | key |
 // |-----------------------------------------------------|-----|
-//                                               ^
-//                                      In-memory pointer.
 
 #pragma pack(push, 1)
 
@@ -371,7 +369,7 @@ class Database {
     FileInfo* file;
     /// Time the record was written.
     uint64_t timestamp;
-    /// Offset to the beginning of the record's value within the data file.
+    /// Offset to the beginning of the record within the data file.
     uint32_t offset;
     /// Size of the value.
     uint32_t size;
@@ -1000,7 +998,7 @@ class Database {
       const Record record{
           .file = file.get(),
           .timestamp = index.timestamp,
-          .offset = uint32_t(index.entry_pos + sizeof(uint64_t) + sizeof(detail::Entry)),
+          .offset = uint32_t(index.entry_pos),
           .size = index.value_size,
       };
 
@@ -1030,7 +1028,7 @@ class Database {
       const Record record{
           .file = file.get(),
           .timestamp = e.timestamp,
-          .offset = uint32_t(offset + sizeof(uint64_t) + sizeof(detail::Entry)),
+          .offset = uint32_t(offset),
           .size = uint32_t(value.size()),
       };
 
@@ -1069,7 +1067,7 @@ class Database {
 
     return
         // Ensure that the offset of the value does not overflow.
-        (current_size + (sizeof(uint64_t) + sizeof(detail::Entry)) > kMaxEntryOffset) ||
+        (current_size) > kMaxEntryOffset ||
         // Ensure that the limit of the file size will not be exceeded.
         (current_size + length > options_.max_file_size);
   }
@@ -1117,12 +1115,12 @@ class Database {
     }
 
     if (options.verify_checksums) {
-      size_t offset = record.offset - (sizeof(uint64_t) + sizeof(detail::Entry));
+      size_t offset = record.offset;
       detail::Entry e;
       std::string key;
       return std::get<1>(ReadEntryImpl(record.file->fd, offset, true, e, key, value));
     } else {
-      size_t offset = record.offset;
+      size_t offset = record.offset + (sizeof(uint64_t) + sizeof(detail::Entry));
       // Allocate memory for the value.
       value.resize(record.size);
       // Load value.
@@ -1182,7 +1180,7 @@ class Database {
       uint64_t crc;
       const detail::Index index{
           .timestamp = rec.timestamp,
-          .entry_pos = uint32_t(rec.offset - (sizeof(uint64_t) + sizeof(detail::Entry))),
+          .entry_pos = uint32_t(rec.offset),
           .value_size = rec.size,
           .key_size = uint16_t(key.size()),
           .flags = uint8_t(is_tombstone ? detail::kEntryFlagTombstone : 0),
@@ -1376,7 +1374,7 @@ class Database {
     const Record record{
         .file = file.get(),
         .timestamp = timestamp,
-        .offset = uint32_t(offset + sizeof(uint64_t) + sizeof(detail::Entry)),
+        .offset = uint32_t(offset),
         .size = uint32_t(value.size()),
     };
 
