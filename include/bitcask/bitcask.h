@@ -398,7 +398,7 @@ class Database {
     }
     // Close read-only files.
     for (const auto& parts : files_) {
-      std::for_each(parts.begin(), parts.end(), [this](const auto& f) { f->CloseFile(); });
+      std::for_each(parts.begin(), parts.end(), [](const auto& f) { f->CloseFile(); });
     }
   }
 
@@ -530,7 +530,7 @@ class Database {
     // Update key-set
     if (updated_keys_) {
       // During the merging process only the updated_keys_ can be modified.
-      if (auto ki = updated_keys_->find(key); ki == keys_.end()) {
+      if (auto ki = updated_keys_->find(key); ki == updated_keys_->end()) {
         updated_keys_->emplace(key, record);
       } else {
         ki->second.file->obsolete.fetch_add(1);
@@ -557,7 +557,7 @@ class Database {
     std::lock_guard file_lock(file_mutex_);
 
     for (const auto& parts : files_) {
-      std::for_each(parts.begin(), parts.end(), [this](const auto& f) { f->CloseFile(); });
+      std::for_each(parts.begin(), parts.end(), [](const auto& f) { f->CloseFile(); });
     }
   }
 
@@ -890,7 +890,9 @@ class Database {
           });
 
       if (status) {
-        updates.emplace_back(ki, rec);
+        if (ki != keys_.end()) {
+          updates.emplace_back(ki, rec);
+        }
       } else {
         return status;
       }
@@ -1063,7 +1065,7 @@ class Database {
     for (size_t offset = range.first, end = range.second; offset < end;) {
       detail::Entry e;
 
-      auto [read, status] = ReadEntryImpl(file->fd, offset, false, e, key, value);
+      auto [read, status] = ReadEntryImpl(fd, offset, false, e, key, value);
       if (!status) {
         return status;
       }
