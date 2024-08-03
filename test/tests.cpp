@@ -1,4 +1,8 @@
 #include <bitcask/bitcask.h>
+#include <bitcask/format.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include <iostream>
 #include <set>
@@ -60,7 +64,7 @@ TEST_CASE("Check consistency on read") {
   REQUIRE(fd != -1);
   REQUIRE(
       ::pwrite(fd, "x", 1,
-          sizeof(bitcask::detail::Header) + sizeof(uint64_t) + sizeof(bitcask::detail::Entry) + 2) != -1);
+          sizeof(bitcask::format::Header) + sizeof(uint64_t) + sizeof(bitcask::format::Entry) + 2) != -1);
   ::close(fd);
 
   REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));

@@ -28,10 +28,20 @@ endif()
 
 set(BITCASK_PUBLIC_INCLUDE_DIR "include/bitcask")
 
-add_library(bitcask INTERFACE)
+add_library(bitcask STATIC)
+
+target_sources(bitcask
+  PUBLIC
+    "include/bitcask/bitcask.h"
+    "include/bitcask/format.h"
+  PRIVATE
+    "src/bitcask.cc"
+    "src/util.h"
+    "src/xxhash.h"
+)
 
 target_include_directories(bitcask
-  INTERFACE
+  PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
