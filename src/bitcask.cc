@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <format>
 #include <numeric>
 
 #include "bitcask/errors.h"
@@ -22,6 +23,8 @@
 #else
 #error "Platform is not supported"
 #endif
+
+static constexpr unsigned kMaximumSlotsCount = 4681u;
 
 namespace bitcask {
 namespace {
@@ -173,13 +176,14 @@ std::error_code Database::FileInfo::EnsureReadable() {
 
 Database::Database(const Options& options, const std::filesystem::path& path)
     : options_(options), base_path_(path), active_files_(std::max<unsigned>(1u, options.active_files)) {
+  const auto compaction_levels = std::min<unsigned>(4u, options_.compaction_levels);
   // Calculate number of slots for an LSM-tree with up to 8 nodes per level, starting with the second.
-  compaction_slots_count_ = ((1ull << (3 * (options_.compaction_levels + 1))) - 1) / 7;
+  compaction_slots_count_ = ((1ull << (3 * (compaction_levels + 1))) - 1) / 7;
 
   // Allocate compaction slots.
   files_.resize(compaction_slots_count_);
 
-  compaction_levels_.resize(options_.compaction_levels + 1);
+  compaction_levels_.resize(compaction_levels + 1);
   // Fill ranges of compaction levels.
   for (int i = 1, end = options_.compaction_levels + 1; i != end; ++i) {
     compaction_levels_[i].first = (compaction_levels_[i - 1].first * 8) + 1;
@@ -559,9 +563,12 @@ std::error_code Database::Initialize() {
     if (!entry.is_regular_file()) {
       continue;
     }
+    if (entry.path().extension() != ".dat") {
+      continue;
+    }
 
     auto index = ParseLayoutIndex(entry.path().filename().string());
-    if (!index || index.value() > 10000) {
+    if (!(index && index.value() < kMaximumSlotsCount)) {
       continue;
     }
 
@@ -635,8 +642,8 @@ std::error_code Database::PackFiles(
           }
 
           if (output[i].empty() || IsCapacityExceeded(output[i].back()->size, length)) {
-            auto [file, ec] = MakeWritableFile(
-                std::to_string(index) + "-" + std::to_string(++clock_) + ".dat", options_.write_index);
+            auto [file, ec] =
+                MakeWritableFile(std::format("{:0>4}-{}.tmp", index, ++clock_), options_.write_index);
             if (ec) {
               assert(!bool(file));
               return {{}, ec};
@@ -654,6 +661,22 @@ std::error_code Database::PackFiles(
     if (ki != keys_.end()) {
       updates.emplace_back(ki, rec);
     }
+
+    return {};
+  };
+
+  const auto rename_temporary = [](const auto& file) -> std::error_code {
+    std::error_code ec;
+
+    const auto target = std::filesystem::path(file->path).replace_extension("dat");
+    // Move file.
+    std::filesystem::rename(file->path, target, ec);
+    // Check error code.
+    if (ec) {
+      return ec;
+    }
+    // Update location of the file.
+    file->path = std::move(target);
 
     return {};
   };
@@ -677,9 +700,7 @@ std::error_code Database::PackFiles(
 
   // 2. Finalize output files.
   for (size_t i = 0, end = output.size(); i != end; ++i) {
-    const auto& f = output[i];
-
-    std::for_each(f.begin(), f.end(), [this](auto& f) {
+    for (const auto& f : output[i]) {
       // Append index at the end of file.
       if (options_.write_index) {
         WriteIndex(f); // TODO: handle errors.
@@ -687,7 +708,11 @@ std::error_code Database::PackFiles(
       // Ensure that all data has been written to the storage device
       // before deleting the source files.
       f->CloseFile(true);
-    });
+      // Rename temporary file.
+      if (auto ec = rename_temporary(f)) {
+        return ec;
+      }
+    }
   }
 
   // 3. Assign new location for the entries read from the input files.
@@ -940,7 +965,7 @@ std::pair<Database::Record, std::error_code> Database::WriteEntry(const std::str
 
     // Create new active file if none exists.
     if (!bool(active_file.file)) {
-      auto [file, ec] = MakeWritableFile("0-" + std::to_string(++clock_) + ".dat", false);
+      auto [file, ec] = MakeWritableFile(std::format("0000-{}.dat", ++clock_), false);
       if (ec) {
         assert(!bool(file));
         return {{}, ec};
