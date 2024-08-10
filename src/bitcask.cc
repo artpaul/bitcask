@@ -122,7 +122,7 @@ std::error_code Database::FileInfo::Append(const std::span<const iovec>& parts, 
     ::fsync(fd);
   }
   // Update total size of the file.
-  size.fetch_add(length);
+  size += length;
 
   return {};
 }
@@ -903,7 +903,7 @@ std::error_code Database::ReadValue(
     size_t offset = record.offset;
     format::Entry e;
     std::string key;
-    return std::get<1>(ReadEntryImpl(record.file->fd, offset, true, e, key, value));
+    return ReadEntryImpl(record.file->fd, offset, true, e, key, value).second;
   } else {
     size_t offset = record.offset + (sizeof(uint64_t) + sizeof(format::Entry));
     // Allocate memory for the value.
@@ -961,7 +961,7 @@ std::error_code Database::WriteIndex(const std::shared_ptr<FileInfo>& file) {
     uint64_t crc;
     const format::Index index{
         .timestamp = rec.timestamp,
-        .entry_pos = uint32_t(rec.offset),
+        .entry_pos = rec.offset,
         .value_size = rec.size,
         .key_size = uint16_t(key.size()),
         .flags = uint8_t(is_tombstone ? format::kEntryFlagTombstone : 0),
@@ -978,7 +978,7 @@ std::error_code Database::WriteIndex(const std::shared_ptr<FileInfo>& file) {
     return file->Append(parts, false);
   };
 
-  format::Footer footer{.entries = sizeof(format::Header), .index = file->size.load()};
+  format::Footer footer{.entries = sizeof(format::Header), .index = file->size};
   // Write index entries.
   if (auto ec = EnumerateEntries(file, std::make_pair(footer.entries, footer.index), cb)) {
     return ec;
@@ -1010,10 +1010,10 @@ std::error_code Database::LoadFileSections(const std::shared_ptr<FileInfo>& file
     sections->header = std::pair{0, sizeof(header)};
     sections->entries = std::pair{footer.entries, footer.index};
     sections->index = std::pair{footer.index, file->size - sizeof(footer)};
-    sections->footer = std::pair{file->size - sizeof(footer), file->size.load()};
+    sections->footer = std::pair{file->size - sizeof(footer), file->size};
   } else {
     sections->header = std::pair{0, sizeof(header)};
-    sections->entries = std::pair{sizeof(header), file->size.load()};
+    sections->entries = std::pair{sizeof(header), file->size};
   }
 
   return {};

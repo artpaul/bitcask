@@ -84,7 +84,7 @@ class Database {
 
     /// Total size of the file.
     /// The size is only updated on writing or set on loading.
-    std::atomic_uint64_t size{0};
+    uint64_t size{0};
 
     /// Number of records with a value.
     std::atomic_uint64_t records{0};
@@ -239,9 +239,9 @@ class Database {
   std::error_code ReadValue(const ReadOptions& options, const Record& record, std::string& value) const;
 
   /**
-   * Writes the data to the active data file.
+   * Writes a record to the active data file.
    *
-   * @returns written record or an error code if the write was unseccessful.
+   * @returns Descriptor of the written record or an error code if the write was unsuccessful.
    */
   std::pair<Record, std::error_code> WriteEntry(const std::string_view key, const std::string_view value,
       const uint64_t timestamp, const bool is_tombstone, const bool sync);
