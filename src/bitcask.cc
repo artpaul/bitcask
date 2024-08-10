@@ -492,6 +492,7 @@ std::error_code Database::Rotate() {
 }
 
 std::error_code Database::Initialize() {
+  std::vector<std::filesystem::path> cleanup;
   unordered_string_map<uint64_t> tombstones;
 
   const auto cb = [&](const Record& record, bool is_tombstone, std::string_view key) -> std::error_code {
@@ -560,6 +561,9 @@ std::error_code Database::Initialize() {
       continue;
     }
     if (entry.path().extension() != ".dat") {
+      if (options_.clean_temporary_on_startup && entry.path().extension() == ".tmp") {
+        cleanup.push_back(entry.path());
+      }
       continue;
     }
 
@@ -589,6 +593,14 @@ std::error_code Database::Initialize() {
       files_[index.value()].push_back(std::move(file));
     }
   }
+
+  // Cleanup temporaries.
+  for (const auto& path : cleanup) {
+    std::error_code ec;
+
+    std::filesystem::remove(path, ec);
+  }
+
   return {};
 }
 

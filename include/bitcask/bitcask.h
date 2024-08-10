@@ -27,6 +27,9 @@ struct Options {
 
   uint32_t max_file_size = std::numeric_limits<uint32_t>::max();
 
+  /// If the database has been loaded successfully, clean up any temporary files at startup.
+  bool clean_temporary_on_startup = true;
+
   /// Flush in-core data to storage device after write.
   bool data_sync = false;
 
