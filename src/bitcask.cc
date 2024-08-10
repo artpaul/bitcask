@@ -559,9 +559,12 @@ std::error_code Database::Initialize() {
     if (!entry.is_regular_file()) {
       continue;
     }
+    if (entry.path().extension() != ".dat") {
+      continue;
+    }
 
     auto index = ParseLayoutIndex(entry.path().filename().string());
-    if (!index || index.value() > 10000) {
+    if (!index) {
       continue;
     }
 
@@ -636,7 +639,7 @@ std::error_code Database::PackFiles(
 
           if (output[i].empty() || IsCapacityExceeded(output[i].back()->size, length)) {
             auto [file, ec] = MakeWritableFile(
-                std::to_string(index) + "-" + std::to_string(++clock_) + ".dat", options_.write_index);
+                std::to_string(index) + "-" + std::to_string(++clock_) + ".tmp", options_.write_index);
             if (ec) {
               assert(!bool(file));
               return {{}, ec};
@@ -654,6 +657,22 @@ std::error_code Database::PackFiles(
     if (ki != keys_.end()) {
       updates.emplace_back(ki, rec);
     }
+
+    return {};
+  };
+
+  const auto rename_temporary = [](const auto& file) -> std::error_code {
+    std::error_code ec;
+
+    const auto target = std::filesystem::path(file->path).replace_extension("dat");
+    // Move file.
+    std::filesystem::rename(file->path, target, ec);
+    // Check error code.
+    if (ec) {
+      return ec;
+    }
+    // Update location of the file.
+    file->path = std::move(target);
 
     return {};
   };
@@ -677,9 +696,7 @@ std::error_code Database::PackFiles(
 
   // 2. Finalize output files.
   for (size_t i = 0, end = output.size(); i != end; ++i) {
-    const auto& f = output[i];
-
-    std::for_each(f.begin(), f.end(), [this](auto& f) {
+    for (const auto& f : output[i]) {
       // Append index at the end of file.
       if (options_.write_index) {
         WriteIndex(f); // TODO: handle errors.
@@ -687,7 +704,11 @@ std::error_code Database::PackFiles(
       // Ensure that all data has been written to the storage device
       // before deleting the source files.
       f->CloseFile(true);
-    });
+      // Rename temporary file.
+      if (auto ec = rename_temporary(f)) {
+        return ec;
+      }
+    }
   }
 
   // 3. Assign new location for the entries read from the input files.
