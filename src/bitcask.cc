@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <format>
 #include <numeric>
 
 #include "bitcask/errors.h"
@@ -640,8 +639,8 @@ std::error_code Database::PackFiles(
           }
 
           if (output[i].empty() || IsCapacityExceeded(output[i].back()->size, length)) {
-            auto [file, ec] =
-                MakeWritableFile(std::format("{:0>4}-{}.tmp", index, ++clock_), options_.write_index);
+            auto [file, ec] = MakeWritableFile(
+                std::to_string(index) + "-" + std::to_string(++clock_) + ".dat", options_.write_index);
             if (ec) {
               assert(!bool(file));
               return {{}, ec};
@@ -963,7 +962,7 @@ std::pair<Database::Record, std::error_code> Database::WriteEntry(const std::str
 
     // Create new active file if none exists.
     if (!bool(active_file.file)) {
-      auto [file, ec] = MakeWritableFile(std::format("0000-{}.dat", ++clock_), false);
+      auto [file, ec] = MakeWritableFile("0-" + std::to_string(++clock_) + ".dat", false);
       if (ec) {
         assert(!bool(file));
         return {{}, ec};

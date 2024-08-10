@@ -59,7 +59,7 @@ TEST_CASE("Check consistency on read") {
   REQUIRE_FALSE(db->Put({}, "abc", "test"));
   db.reset();
 
-  const auto path = temp_dir.GetPath() + "/0000-2.dat";
+  const auto path = temp_dir.GetPath() + "/0-2.dat";
   REQUIRE(std::filesystem::exists(path));
   int fd = ::open(path.c_str(), O_WRONLY);
   REQUIRE(fd != -1);
