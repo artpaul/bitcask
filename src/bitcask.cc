@@ -173,14 +173,13 @@ std::error_code Database::FileInfo::EnsureReadable() {
 
 Database::Database(const Options& options, const std::filesystem::path& path)
     : options_(options), base_path_(path), active_files_(std::max<unsigned>(1u, options.active_files)) {
-  const auto compaction_levels = std::min<unsigned>(4u, options_.compaction_levels);
   // Calculate number of slots for an LSM-tree with up to 8 nodes per level, starting with the second.
-  compaction_slots_count_ = ((1ull << (3 * (compaction_levels + 1))) - 1) / 7;
+  compaction_slots_count_ = ((1ull << (3 * (options_.compaction_levels + 1))) - 1) / 7;
 
   // Allocate compaction slots.
   files_.resize(compaction_slots_count_);
 
-  compaction_levels_.resize(compaction_levels + 1);
+  compaction_levels_.resize(options_.compaction_levels + 1);
   // Fill ranges of compaction levels.
   for (int i = 1, end = options_.compaction_levels + 1; i != end; ++i) {
     compaction_levels_[i].first = (compaction_levels_[i - 1].first * 8) + 1;
