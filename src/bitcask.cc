@@ -24,8 +24,6 @@
 #error "Platform is not supported"
 #endif
 
-static constexpr unsigned kMaximumSlotsCount = 4681u;
-
 namespace bitcask {
 namespace {
 
@@ -568,7 +566,7 @@ std::error_code Database::Initialize() {
     }
 
     auto index = ParseLayoutIndex(entry.path().filename().string());
-    if (!(index && index.value() < kMaximumSlotsCount)) {
+    if (!index) {
       continue;
     }
 
