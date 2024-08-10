@@ -4,10 +4,13 @@
 #include <cstring>
 #include <numeric>
 
+#include "bitcask/errors.h"
 #include "bitcask/format.h"
 #include "util.h"
 
+#ifndef XXH_INLINE_ALL
 #define XXH_INLINE_ALL
+#endif
 #include "xxhash.h"
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -40,14 +43,14 @@ uint64_t Hash64(const std::span<const iovec, N>& parts) noexcept {
   return XXH64_digest(state.get());
 }
 
-Status LoadFromFile(int fd, void* buf, size_t len, size_t& off) noexcept {
+std::error_code LoadFromFile(int fd, void* buf, size_t len, size_t& off) noexcept {
   while (len) {
     int ret = ::pread(fd, buf, len, off);
 
     if (ret == -1) {
-      return Status::IOError(errno);
+      return std::make_error_code(static_cast<std::errc>(errno));
     } else if (ret == 0) {
-      return Status::IOError(0);
+      return MakeErrorCode(BitcaskError::kUnexpectedEndOfFile);
     } else {
       buf = static_cast<std::byte*>(buf) + ret;
       len -= ret;
@@ -59,30 +62,29 @@ Status LoadFromFile(int fd, void* buf, size_t len, size_t& off) noexcept {
 }
 
 /// Reads full content of an entry.
-std::tuple<size_t, Status> ReadEntryImpl(const int fd, const size_t offset, const bool check_crc,
+std::pair<size_t, std::error_code> ReadEntryImpl(const int fd, const size_t offset, const bool check_crc,
     format::Entry& entry, std::string& key, std::string& value) {
   size_t current_offset = offset;
   uint64_t crc;
-  Status status;
   // Load crc.
-  if (!(status = LoadFromFile(fd, &crc, sizeof(crc), current_offset))) {
-    return {{}, status};
+  if (auto ec = LoadFromFile(fd, &crc, sizeof(crc), current_offset)) {
+    return {{}, ec};
   }
   // Load entry.
-  if (!(status = LoadFromFile(fd, &entry, sizeof(entry), current_offset))) {
-    return {{}, status};
+  if (auto ec = LoadFromFile(fd, &entry, sizeof(entry), current_offset)) {
+    return {{}, ec};
   }
   // Validate entry.
   // TODO: max_value_size
   key.resize(entry.key_size);
   value.resize(entry.value_size);
   // Load value.
-  if (!(status = LoadFromFile(fd, value.data(), value.size(), current_offset))) {
-    return {{}, status};
+  if (auto ec = LoadFromFile(fd, value.data(), value.size(), current_offset)) {
+    return {{}, ec};
   }
   // Load key.
-  if (!(status = LoadFromFile(fd, key.data(), key.size(), current_offset))) {
-    return {{}, status};
+  if (auto ec = LoadFromFile(fd, key.data(), key.size(), current_offset)) {
+    return {{}, ec};
   }
 
   // Check crc.
@@ -94,7 +96,7 @@ std::tuple<size_t, Status> ReadEntryImpl(const int fd, const size_t offset, cons
     };
 
     if (Hash64(std::span(parts)) != crc) {
-      return {{}, Status::Inconsistent()};
+      return {{}, MakeErrorCode(BitcaskError::kInconsistent)};
     }
   }
 
@@ -103,37 +105,17 @@ std::tuple<size_t, Status> ReadEntryImpl(const int fd, const size_t offset, cons
 
 } // namespace
 
-std::string Status::Message() const {
-  switch (code_) {
-    case Code::kSuccess:
-      return "OK";
-    case Code::kNotFound:
-      return "Not found";
-    case Code::kInconsistent:
-      return "Inconsistent";
-    case Code::kInProgress:
-      return "In progress";
-    case Code::kInvalidArgument:
-      return "Invalid argument";
-    case Code::kIOError:
-      return ::strerror(errno_);
-    case Code::kReadOnly:
-      return "Readn only";
-  }
-  return {};
-}
-
-Status Database::FileInfo::Append(const std::span<const iovec>& parts, const bool sync) noexcept {
+std::error_code Database::FileInfo::Append(const std::span<const iovec>& parts, const bool sync) noexcept {
   const size_t length = std::accumulate(
       parts.begin(), parts.end(), 0ul, [](const auto acc, const auto& p) { return acc + p.iov_len; });
 
   const ssize_t ret = ::writev(fd, parts.data(), parts.size());
   // Write errors.
   if (ret == -1) {
-    return Status::IOError(errno);
+    return std::make_error_code(static_cast<std::errc>(errno));
   }
   if (ret != length) {
-    return Status::IOError(0);
+    return std::make_error_code(std::errc::io_error);
   }
   // Force flush of written data.
   if (sync) {
@@ -173,7 +155,7 @@ bool Database::FileInfo::CloseFile(bool sync) {
   return true;
 }
 
-Status Database::FileInfo::EnsureReadable() {
+std::error_code Database::FileInfo::EnsureReadable() {
   // Acquire exclusive access to a file descriptor to avoid opening the file
   // multiple times.
   std::lock_guard fd_lock(fd_mutex);
@@ -182,7 +164,7 @@ Status Database::FileInfo::EnsureReadable() {
     fd = ::open(path.c_str(), O_RDONLY);
     // Cannot open file for reading.
     if (fd == -1) {
-      return Status::IOError(errno);
+      return std::make_error_code(static_cast<std::errc>(errno));
     }
   }
 
@@ -218,21 +200,18 @@ Database::~Database() {
   }
 }
 
-Status Database::Open(
+std::error_code Database::Open(
     const Options& options, const std::filesystem::path& path, std::unique_ptr<Database>& db) {
   db = std::unique_ptr<Database>(new Database(options, path));
   // Scan database directory.
-  if (auto status = db->Initialize(); !status) {
-    return status;
-  }
-  return {};
+  return db->Initialize();
 }
 
-Status Database::Delete(const WriteOptions& options, const std::string_view key) {
+std::error_code Database::Delete(const WriteOptions& options, const std::string_view key) {
   std::shared_lock op_lock(operation_mutex_);
 
   if (options_.read_only) {
-    return Status::ReadOnly();
+    return MakeErrorCode(BitcaskError::kReadOnly);
   }
 
   const auto timestamp = [this](const auto key) -> std::optional<uint64_t> {
@@ -254,9 +233,9 @@ Status Database::Delete(const WriteOptions& options, const std::string_view key)
 
   [[maybe_unused]] Defer d([this, key] { UnlockKey(key); });
   // Write the tombstone.
-  auto [_, status] = WriteEntry(key, {}, timestamp.value(), true, options.sync);
-  if (!status) {
-    return status;
+  auto [_, ec] = WriteEntry(key, {}, timestamp.value(), true, options.sync);
+  if (ec) {
+    return ec;
   }
 
   std::unique_lock key_lock(key_mutex_);
@@ -293,7 +272,8 @@ void Database::Enumerate(const std::function<void(const std::string_view)>& cb) 
   }
 }
 
-Status Database::Get(const ReadOptions& options, const std::string_view key, std::string* value) const {
+std::error_code Database::Get(
+    const ReadOptions& options, const std::string_view key, std::string* value) const {
   std::shared_lock op_lock(operation_mutex_);
 
   // Looking up for the actual state of the key.
@@ -309,25 +289,25 @@ Status Database::Get(const ReadOptions& options, const std::string_view key, std
     if (value) {
       return ReadValue(options, *record, *value);
     } else {
-      return Status::Success();
+      return {};
     }
   }
 
-  return Status::NotFound();
+  return MakeErrorCode(BitcaskError::kNotFound);
 }
 
-Status Database::Put(
+std::error_code Database::Put(
     const WriteOptions& options, const std::string_view key, const std::string_view value) {
   std::shared_lock op_lock(operation_mutex_);
 
   if (key.size() > std::numeric_limits<decltype(format::Entry::key_size)>::max()) {
-    return Status::InvalidArgument();
+    return MakeErrorCode(BitcaskError::kInvalidArgument);
   }
   if (value.size() > std::numeric_limits<decltype(format::Entry::value_size)>::max()) {
-    return Status::InvalidArgument();
+    return MakeErrorCode(BitcaskError::kInvalidArgument);
   }
   if (options_.read_only) {
-    return Status::ReadOnly();
+    return MakeErrorCode(BitcaskError::kReadOnly);
   }
   // Acquire exclusive access to the key.
   LockKey(key, nullptr);
@@ -336,9 +316,9 @@ Status Database::Put(
 
   [[maybe_unused]] Defer d([this, key] { UnlockKey(key); });
   // Write the value with the specific timestamp.
-  auto [record, status] = WriteEntry(key, value, timestamp, false, options.sync);
-  if (!status) {
-    return status;
+  auto [record, ec] = WriteEntry(key, value, timestamp, false, options.sync);
+  if (ec) {
+    return ec;
   }
 
   std::unique_lock key_lock(key_mutex_);
@@ -372,7 +352,7 @@ void Database::CloseFiles() {
   }
 }
 
-Status Database::Pack(bool force) {
+std::error_code Database::Pack(bool force) {
   for (size_t i = 0; i != compaction_slots_count_; ++i) {
     std::vector<std::shared_ptr<FileInfo>> files;
     CompactionMode mode;
@@ -382,7 +362,7 @@ Status Database::Pack(bool force) {
 
       // Check whether the compaction process is already in progress.
       if (updated_keys_) {
-        return Status::InProgress();
+        return MakeErrorCode(BitcaskError::kInProgress);
       }
 
       std::lock_guard file_lock(file_mutex_);
@@ -438,7 +418,7 @@ Status Database::Pack(bool force) {
       updated_keys_ = std::make_unique<unordered_string_map<Record>>();
     }
 
-    auto status = PackFiles(files, mode, i);
+    auto ec = PackFiles(files, mode, i);
 
     {
       std::unique_lock op_lock(operation_mutex_);
@@ -459,7 +439,14 @@ Status Database::Pack(bool force) {
       updated_keys_.reset();
     }
 
-    if (status) {
+    if (ec) {
+      std::lock_guard file_lock(file_mutex_);
+
+      files_[i].insert(
+          files_[i].end(), std::make_move_iterator(files.begin()), std::make_move_iterator(files.end()));
+
+      return ec;
+    } else {
       // Cleanup processed files.
       for (const auto& file : files) {
         assert(file.use_count() == 1);
@@ -468,25 +455,18 @@ Status Database::Pack(bool force) {
         // Remove processed file from the storage device.
         std::filesystem::remove(file->path);
       }
-    } else {
-      std::lock_guard file_lock(file_mutex_);
-
-      files_[i].insert(
-          files_[i].end(), std::make_move_iterator(files.begin()), std::make_move_iterator(files.end()));
-
-      return status;
     }
   }
 
   return {};
 }
 
-Status Database::Rotate() {
+std::error_code Database::Rotate() {
   std::shared_lock op_lock(operation_mutex_);
   std::vector<std::shared_ptr<FileInfo>> files;
 
   if (options_.read_only) {
-    return Status::ReadOnly();
+    return MakeErrorCode(BitcaskError::kReadOnly);
   }
 
   for (auto& item : active_files_) {
@@ -511,10 +491,10 @@ Status Database::Rotate() {
   return {};
 }
 
-Status Database::Initialize() {
+std::error_code Database::Initialize() {
   unordered_string_map<uint64_t> tombstones;
 
-  const auto cb = [&](const Record& record, const bool is_tombstone, std::string_view key) -> Status {
+  const auto cb = [&](const Record& record, bool is_tombstone, std::string_view key) -> std::error_code {
     clock_ = std::max<uint64_t>(clock_, record.timestamp);
     // Count entries.
     if (is_tombstone) {
@@ -561,8 +541,8 @@ Status Database::Initialize() {
   const auto enumerate_keys = [this](const auto& file, const auto& cb) {
     FileSections sections;
 
-    if (auto s = LoadFileSections(file, &sections); !s) {
-      return s;
+    if (auto ec = LoadFileSections(file, &sections)) {
+      return ec;
     }
 
     if (sections.index) {
@@ -587,16 +567,16 @@ Status Database::Initialize() {
 
     auto file = std::make_shared<FileInfo>(entry.path(), entry.file_size());
     // Open file for reading.
-    if (auto s = file->EnsureReadable(); !s) {
-      return s;
+    if (auto ec = file->EnsureReadable()) {
+      return ec;
     }
     [[maybe_unused]] Defer do_close([file]() { file->CloseFile(); });
     // Read keys from the file.
-    if (auto s = enumerate_keys(file, cb); !s) {
-      if (s.IsNotFound()) {
+    if (auto ec = enumerate_keys(file, cb)) {
+      if (IsNotFound(ec)) {
         continue;
       }
-      return s;
+      return ec;
     }
 
     // Move data file into the read-only set.
@@ -613,7 +593,7 @@ bool Database::IsLastCompactionLevel(const size_t i) const noexcept {
   return i >= compaction_levels_.back().first && i <= compaction_levels_.back().second;
 };
 
-Status Database::PackFiles(
+std::error_code Database::PackFiles(
     const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int slot) {
   std::vector<std::vector<std::shared_ptr<FileInfo>>> output(8);
   std::vector<std::pair<decltype(keys_)::iterator, Record>> updates;
@@ -621,7 +601,7 @@ Status Database::PackFiles(
   static_assert(std::is_trivially_destructible_v<decltype(updates)::value_type>);
 
   const auto cb = [&](const Record& record, const bool is_tombstone, const std::string_view key,
-                      const std::string_view value) -> Status {
+                      const std::string_view value) -> std::error_code {
     auto ki = keys_.find(key);
     if (ki == keys_.end()) {
       if (is_tombstone) {
@@ -643,7 +623,7 @@ Status Database::PackFiles(
       return {};
     }
 
-    const auto [rec, status] = WriteEntryToFile(key, value, record.timestamp, is_tombstone, false,
+    const auto [rec, ec] = WriteEntryToFile(key, value, record.timestamp, is_tombstone, false,
         // Target file provider.
         [&](const uint64_t length) -> FileInfoStatus {
           size_t i = 0;
@@ -655,10 +635,11 @@ Status Database::PackFiles(
           }
 
           if (output[i].empty() || IsCapacityExceeded(output[i].back()->size, length)) {
-            auto [file, status] = MakeWritableFile(
+            auto [file, ec] = MakeWritableFile(
                 std::to_string(index) + "-" + std::to_string(++clock_) + ".dat", options_.write_index);
-            if (!status) {
-              return {{}, status};
+            if (ec) {
+              assert(!bool(file));
+              return {{}, ec};
             }
 
             output[i].push_back(std::move(file));
@@ -666,12 +647,12 @@ Status Database::PackFiles(
           return {output[i].back(), {}};
         });
 
-    if (status) {
-      if (ki != keys_.end()) {
-        updates.emplace_back(ki, rec);
-      }
-    } else {
-      return status;
+    if (ec) {
+      return ec;
+    }
+    // Store updated record.
+    if (ki != keys_.end()) {
+      updates.emplace_back(ki, rec);
     }
 
     return {};
@@ -683,14 +664,14 @@ Status Database::PackFiles(
     std::shared_lock read_lock(file->read_mutex);
 
     // Ensure source file is opened.
-    if (auto s = file->EnsureReadable(); !s) {
-      return s;
+    if (auto ec = file->EnsureReadable()) {
+      return ec;
     }
     // Enumerate all records in the source file.
-    if (auto s = EnumerateEntriesNoLock(file, cb); !s) {
+    if (auto ec = EnumerateEntriesNoLock(file, cb)) {
       read_lock.unlock();
       // TODO: finalize.
-      return s;
+      return ec;
     }
   }
 
@@ -782,27 +763,27 @@ void Database::WaitKeyUnlocked(
   lock.lock();
 }
 
-Status Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
-    const std::function<Status(const Record&, const bool, std::string_view)>& cb) const {
+std::error_code Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file,
+    const FileSections::Range& range,
+    const std::function<std::error_code(const Record&, const bool, std::string_view)>& cb) const {
   const auto fd = file->fd;
   std::string key;
 
   for (size_t offset = range.first, end = range.second; offset < end;) {
     uint64_t crc;
     format::Index index;
-    Status status;
     // Load crc.
-    if (!(status = LoadFromFile(fd, &crc, sizeof(crc), offset))) {
-      return status;
+    if (auto ec = LoadFromFile(fd, &crc, sizeof(crc), offset)) {
+      return ec;
     }
     // Load entry.
-    if (!(status = LoadFromFile(fd, &index, sizeof(index), offset))) {
-      return status;
+    if (auto ec = LoadFromFile(fd, &index, sizeof(index), offset)) {
+      return ec;
     }
     key.resize(index.key_size);
     // Load key.
-    if (!(status = LoadFromFile(fd, key.data(), key.size(), offset))) {
-      return status;
+    if (auto ec = LoadFromFile(fd, key.data(), key.size(), offset)) {
+      return ec;
     }
     // Check crc.
     const std::array parts{
@@ -810,7 +791,7 @@ Status Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file, const Fil
         iovec{.iov_base = key.data(), .iov_len = key.size()},
     };
     if (Hash64(std::span(parts)) != crc) {
-      return Status::Inconsistent();
+      return MakeErrorCode(BitcaskError::kInconsistent);
     }
 
     const Record record{
@@ -820,16 +801,18 @@ Status Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file, const Fil
         .size = index.value_size,
     };
 
-    if (!(status = cb(record, index.flags & format::kEntryFlagTombstone, key))) {
-      return status;
+    if (auto ec = cb(record, index.flags & format::kEntryFlagTombstone, key)) {
+      return ec;
     }
   }
 
   return {};
 }
 
-Status Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
-    const std::function<Status(const Record&, const bool, std::string_view, std::string_view)>& cb) const {
+std::error_code Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file,
+    const FileSections::Range& range,
+    const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>& cb)
+    const {
   const auto fd = file->fd;
   std::string key;
   std::string value;
@@ -837,9 +820,9 @@ Status Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file, const F
   for (size_t offset = range.first, end = range.second; offset < end;) {
     format::Entry e;
 
-    auto [read, status] = ReadEntryImpl(fd, offset, false, e, key, value);
-    if (!status) {
-      return status;
+    auto [read, ec] = ReadEntryImpl(fd, offset, false, e, key, value);
+    if (ec) {
+      return ec;
     }
 
     const Record record{
@@ -849,8 +832,7 @@ Status Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file, const F
         .size = uint32_t(value.size()),
     };
 
-    auto s = cb(record, (e.flags & format::kEntryFlagTombstone), key, value);
-    if (!s) {
+    if (auto s = cb(record, (e.flags & format::kEntryFlagTombstone), key, value)) {
       return s;
     }
 
@@ -860,12 +842,13 @@ Status Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file, const F
   return {};
 }
 
-Status Database::EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
-    const std::function<Status(const Record&, const bool, std::string_view, std::string_view)>& cb) const {
+std::error_code Database::EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
+    const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>& cb)
+    const {
   FileSections sections;
 
-  if (auto s = LoadFileSections(file, &sections); !s) {
-    return s;
+  if (auto ec = LoadFileSections(file, &sections)) {
+    return ec;
   }
 
   return EnumerateEntries(file, sections.entries.value(), cb);
@@ -890,7 +873,7 @@ Database::FileInfoStatus Database::MakeWritableFile(const std::string& name, boo
   auto fd = ::open(path.c_str(), O_APPEND | O_RDWR | O_CREAT | O_EXCL, kDefaultPremissions);
   // Cannot open file for writing.
   if (fd == -1) {
-    return {{}, Status::IOError(errno)};
+    return {{}, std::make_error_code(static_cast<std::errc>(errno))};
   } else {
     const format::Header header{.magic = {'B', 'C', 'S', 'K', 'V', '1'},
         .flags = with_footer ? format::kFileFlagWithFooter : format::kFileFlagNone};
@@ -898,7 +881,7 @@ Database::FileInfoStatus Database::MakeWritableFile(const std::string& name, boo
     if (::write(fd, &header, sizeof(header)) == -1) {
       int err = errno;
       ::close(fd);
-      return {{}, Status::IOError(err)};
+      return {{}, std::make_error_code(static_cast<std::errc>(err))};
     }
   }
   auto file = std::make_shared<FileInfo>(std::move(path), sizeof(format::Header));
@@ -906,13 +889,14 @@ Database::FileInfoStatus Database::MakeWritableFile(const std::string& name, boo
   return {file, {}};
 }
 
-Status Database::ReadValue(const ReadOptions& options, const Record& record, std::string& value) const {
+std::error_code Database::ReadValue(
+    const ReadOptions& options, const Record& record, std::string& value) const {
   // Acquiring read lock to prevent closing the file handle during the read.
   std::shared_lock read_lock(record.file->read_mutex);
 
   // Ensure file is opened.
-  if (auto s = record.file->EnsureReadable(); !s) {
-    return s;
+  if (auto ec = record.file->EnsureReadable()) {
+    return ec;
   }
 
   if (options.verify_checksums) {
@@ -929,7 +913,7 @@ Status Database::ReadValue(const ReadOptions& options, const Record& record, std
   }
 }
 
-std::pair<Database::Record, Status> Database::WriteEntry(const std::string_view key,
+std::pair<Database::Record, std::error_code> Database::WriteEntry(const std::string_view key,
     const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync) {
   ActiveFile& active_file = active_files_.size() == 1
                                 ? active_files_[0]
@@ -956,11 +940,12 @@ std::pair<Database::Record, Status> Database::WriteEntry(const std::string_view 
 
     // Create new active file if none exists.
     if (!bool(active_file.file)) {
-      auto [file, status] = MakeWritableFile("0-" + std::to_string(++clock_) + ".dat", false);
-      if (status) {
-        active_file.file = std::move(file);
+      auto [file, ec] = MakeWritableFile("0-" + std::to_string(++clock_) + ".dat", false);
+      if (ec) {
+        assert(!bool(file));
+        return {{}, ec};
       } else {
-        return {file, status};
+        active_file.file = std::move(file);
       }
     }
 
@@ -970,9 +955,9 @@ std::pair<Database::Record, Status> Database::WriteEntry(const std::string_view 
   return WriteEntryToFile(key, value, timestamp, is_tombstone, sync, file_provider);
 }
 
-Status Database::WriteIndex(const std::shared_ptr<FileInfo>& file) {
+std::error_code Database::WriteIndex(const std::shared_ptr<FileInfo>& file) {
   const auto cb = [&](const Record& rec, const bool is_tombstone, const std::string_view key,
-                      const std::string_view) -> Status {
+                      const std::string_view) {
     uint64_t crc;
     const format::Index index{
         .timestamp = rec.timestamp,
@@ -995,32 +980,31 @@ Status Database::WriteIndex(const std::shared_ptr<FileInfo>& file) {
 
   format::Footer footer{.entries = sizeof(format::Header), .index = file->size.load()};
   // Write index entries.
-  auto s = EnumerateEntries(file, std::make_pair(sizeof(format::Header), file->size.load()), cb);
-  if (!s) {
-    return s;
+  if (auto ec = EnumerateEntries(file, std::make_pair(footer.entries, footer.index), cb)) {
+    return ec;
   }
   // Write footer.
   return file->Append(std::array{iovec{.iov_base = &footer, .iov_len = sizeof(footer)}}, false);
 }
 
-Status Database::LoadFileSections(const std::shared_ptr<FileInfo>& file, FileSections* sections) {
+std::error_code Database::LoadFileSections(const std::shared_ptr<FileInfo>& file, FileSections* sections) {
   format::Header header;
   size_t offset = 0;
   // Load header.
-  if (auto s = LoadFromFile(file->fd, &header, sizeof(header), offset); !s) {
-    return s;
+  if (auto ec = LoadFromFile(file->fd, &header, sizeof(header), offset)) {
+    return ec;
   } else if (std::memcmp(header.magic, format::kFileMagicV1, format::kFileMagicSize) != 0) {
-    return Status::NotFound();
+    return MakeErrorCode(BitcaskError::kNotFound);
   }
   // Load footer.
   if (header.flags & format::kFileFlagWithFooter) {
     format::Footer footer;
     size_t footer_offset = file->size - sizeof(footer);
-    if (auto s = LoadFromFile(file->fd, &footer, sizeof(footer), footer_offset); !s) {
-      return s;
+    if (auto ec = LoadFromFile(file->fd, &footer, sizeof(footer), footer_offset)) {
+      return ec;
     }
     if (footer.entries > footer.index) {
-      return Status::Inconsistent();
+      return MakeErrorCode(BitcaskError::kInconsistent);
     }
 
     sections->header = std::pair{0, sizeof(header)};
@@ -1050,7 +1034,7 @@ std::optional<int> Database::ParseLayoutIndex(std::string_view name) {
   return {};
 }
 
-std::pair<Database::Record, Status> Database::WriteEntryToFile(const std::string_view key,
+std::pair<Database::Record, std::error_code> Database::WriteEntryToFile(const std::string_view key,
     const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync,
     const std::function<FileInfoStatus(uint64_t)>& cb) {
   assert(!is_tombstone || value.empty());
@@ -1076,15 +1060,15 @@ std::pair<Database::Record, Status> Database::WriteEntryToFile(const std::string
   // Calculate crc.
   crc = Hash64(std::span(parts).subspan<1>());
 
-  const auto [file, status] = cb(length);
-  if (!status) {
-    return {{}, status};
+  const auto [file, ec] = cb(length);
+  if (ec) {
+    return {{}, ec};
   }
   // Offset at which new entry will be written.
   const uint64_t offset = file->size;
   // Write data to the file.
-  if (auto status = file->Append(parts, sync); !status) {
-    return {{}, status};
+  if (auto ec = file->Append(parts, sync)) {
+    return {{}, ec};
   }
 
   // Count entries.

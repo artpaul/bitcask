@@ -1,4 +1,5 @@
 #include <bitcask/bitcask.h>
+#include <bitcask/errors.h>
 #include <bitcask/format.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -28,14 +29,14 @@ TEST_CASE("Create database") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
 }
 
 TEST_CASE("Enumerate keys") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
   for (size_t i = 0; i < 5; ++i) {
     db->Put({}, std::to_string(i), std::to_string(i));
   }
@@ -54,8 +55,8 @@ TEST_CASE("Check consistency on read") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
-  REQUIRE(db->Put({}, "abc", "test"));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(db->Put({}, "abc", "test"));
   db.reset();
 
   const auto path = temp_dir.GetPath() + "/0-2.dat";
@@ -67,62 +68,62 @@ TEST_CASE("Check consistency on read") {
           sizeof(bitcask::format::Header) + sizeof(uint64_t) + sizeof(bitcask::format::Entry) + 2) != -1);
   ::close(fd);
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
   std::string value;
-  REQUIRE(db->Get({.verify_checksums = false}, "abc", &value));
+  REQUIRE_FALSE(db->Get({.verify_checksums = false}, "abc", &value));
   CHECK(value == "text");
 
-  REQUIRE_FALSE(db->Get({.verify_checksums = true}, "abc", &value));
+  REQUIRE(db->Get({.verify_checksums = true}, "abc", &value));
 }
 
 TEST_CASE("Key overflow") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
 
   std::string key;
   key.resize(std::numeric_limits<uint16_t>::max() + 100);
   key[1050] = 'a';
 
-  REQUIRE_FALSE(db->Put({}, key, "test"));
+  REQUIRE(db->Put({}, key, "test"));
   db.reset();
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
-  CHECK_FALSE(db->Get({}, key, nullptr));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  CHECK(db->Get({}, key, nullptr));
 }
 
 TEST_CASE("Load sections") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(
+  REQUIRE_FALSE(
       bitcask::Database::Open({.max_file_size = 16 << 10, .write_index = true}, temp_dir.GetPath(), db));
 
   const std::string value = "some content larger than header";
-  REQUIRE(db->Put({}, "1", value));
-  REQUIRE(db->Put({}, "2", value));
-  REQUIRE(db->Put({}, "3", value));
-  REQUIRE(db->Rotate());
-  REQUIRE(db->Put({}, "4", value));
-  REQUIRE(db->Put({}, "5", value));
-  REQUIRE(db->Rotate());
-  REQUIRE(db->Pack(true));
-  REQUIRE(db->Put({}, "6", value));
-  REQUIRE(db->Put({}, "7", value));
-  REQUIRE(db->Rotate());
-  REQUIRE(db->Pack(true));
+  REQUIRE_FALSE(db->Put({}, "1", value));
+  REQUIRE_FALSE(db->Put({}, "2", value));
+  REQUIRE_FALSE(db->Put({}, "3", value));
+  REQUIRE_FALSE(db->Rotate());
+  REQUIRE_FALSE(db->Put({}, "4", value));
+  REQUIRE_FALSE(db->Put({}, "5", value));
+  REQUIRE_FALSE(db->Rotate());
+  REQUIRE_FALSE(db->Pack(true));
+  REQUIRE_FALSE(db->Put({}, "6", value));
+  REQUIRE_FALSE(db->Put({}, "7", value));
+  REQUIRE_FALSE(db->Rotate());
+  REQUIRE_FALSE(db->Pack(true));
 }
 
 TEST_CASE("Non existent") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
   std::string value;
-  REQUIRE_FALSE(db->Get({}, "abc", &value));
-  REQUIRE_FALSE(db->Get({}, "abc", nullptr));
-  REQUIRE(db->Delete({}, "abc"));
+  REQUIRE(db->Get({}, "abc", &value));
+  REQUIRE(db->Get({}, "abc", nullptr));
+  REQUIRE_FALSE(db->Delete({}, "abc"));
 }
 
 TEST_CASE("Read after reopen") {
@@ -131,16 +132,16 @@ TEST_CASE("Read after reopen") {
   auto options = kDefaultOptions;
   options.data_sync = true;
 
-  REQUIRE(bitcask::Database::Open(options, temp_dir.GetPath(), db));
-  REQUIRE(db->Put({}, "abc", "test"));
-  REQUIRE(db->Put({}, "abc", "text"));
+  REQUIRE_FALSE(bitcask::Database::Open(options, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(db->Put({}, "abc", "test"));
+  REQUIRE_FALSE(db->Put({}, "abc", "text"));
 
   db.reset();
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
 
   std::string value;
-  REQUIRE(db->Get({}, "abc", &value));
+  REQUIRE_FALSE(db->Get({}, "abc", &value));
   CHECK(value == "text");
 }
 
@@ -157,15 +158,15 @@ TEST_CASE("Record large than max size of file") {
   }
   data[123456] = 'a';
 
-  REQUIRE(bitcask::Database::Open(options, temp_dir.GetPath(), db));
-  REQUIRE(db->Put({}, "abc", data));
-  REQUIRE(db->Pack(true));
+  REQUIRE_FALSE(bitcask::Database::Open(options, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(db->Put({}, "abc", data));
+  REQUIRE_FALSE(db->Pack(true));
 
   db.reset();
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
   std::string value;
-  REQUIRE(db->Get({}, "abc", &value));
+  REQUIRE_FALSE(db->Get({}, "abc", &value));
   CHECK(data == value);
 }
 
@@ -173,8 +174,8 @@ TEST_CASE("Unknown file in the directory") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
-  REQUIRE(db->Put({}, "abc", "test"));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(db->Put({}, "abc", "test"));
   db.reset();
 
   const auto path = temp_dir.GetPath() + "/5-100.dat";
@@ -184,9 +185,9 @@ TEST_CASE("Unknown file in the directory") {
   REQUIRE(::write(fd, data.data(), data.size()) != -1);
   ::close(fd);
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
   std::string value;
-  REQUIRE(db->Get({.verify_checksums = true}, "abc", &value));
+  REQUIRE_FALSE(db->Get({.verify_checksums = true}, "abc", &value));
   CHECK(value == "test");
 }
 
@@ -194,12 +195,12 @@ TEST_CASE("Update value") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
 
-  REQUIRE(db->Put({}, "abc", "test"));
-  REQUIRE(db->Put({}, "abc", "text"));
+  REQUIRE_FALSE(db->Put({}, "abc", "test"));
+  REQUIRE_FALSE(db->Put({}, "abc", "text"));
   std::string value;
-  REQUIRE(db->Get({}, "abc", &value));
+  REQUIRE_FALSE(db->Get({}, "abc", &value));
   CHECK(value == "text");
 }
 
@@ -207,28 +208,29 @@ TEST_CASE("Write / Read / Delete") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
 
-  REQUIRE(db->Put({}, "abc", "test"));
+  REQUIRE_FALSE(db->Put({}, "abc", "test"));
   std::string value;
-  REQUIRE(db->Get({}, "abc", &value));
+  REQUIRE_FALSE(db->Get({}, "abc", &value));
   CHECK(value == "test");
-  REQUIRE(db->Delete({}, "abc"));
-  REQUIRE_FALSE(db->Get({}, "abc", nullptr));
+  REQUIRE_FALSE(db->Delete({}, "abc"));
+  REQUIRE(db->Get({}, "abc", nullptr));
 }
 
 TEST_CASE("Write multiple active files") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open({.active_files = 3, .max_file_size = 16 << 10}, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(
+      bitcask::Database::Open({.active_files = 3, .max_file_size = 16 << 10}, temp_dir.GetPath(), db));
   const std::string value = "some content larger than header";
   for (size_t i = 0; i < 1000; ++i) {
     db->Put({}, std::to_string(i), value + std::to_string(i));
   }
 
   std::string tmp;
-  REQUIRE(db->Get({.verify_checksums = true}, std::to_string(512), &tmp));
+  REQUIRE_FALSE(db->Get({.verify_checksums = true}, std::to_string(512), &tmp));
   CHECK(tmp == "some content larger than header512");
 }
 
@@ -236,7 +238,7 @@ TEST_CASE("Write single key by multiple threads") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open({.max_file_size = 16 << 10}, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open({.max_file_size = 16 << 10}, temp_dir.GetPath(), db));
 
   std::vector<std::thread> threads;
   const std::string value = "some content larger than header";
@@ -275,7 +277,7 @@ TEST_CASE("Write single key by multiple threads") {
   }
   std::string tmp;
   auto s = db->Get({}, "abc", &tmp);
-  CHECK((s.IsNotFound() || (s.IsSuccess() && tmp == value)));
+  CHECK((bitcask::IsNotFound(s) || (!s && tmp == value)));
 }
 
 #ifdef __linux__
@@ -283,7 +285,7 @@ TEST_CASE("Limit of opened files") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
 
-  REQUIRE(bitcask::Database::Open({.max_file_size = 4 << 10}, temp_dir.GetPath(), db));
+  REQUIRE_FALSE(bitcask::Database::Open({.max_file_size = 4 << 10}, temp_dir.GetPath(), db));
 
   std::string s;
   s.resize(1024);
@@ -301,12 +303,12 @@ TEST_CASE("Limit of opened files") {
 
   for (size_t i = 0; i < 4 * 16;) {
     std::string tmp;
-    auto status = db->Get({}, std::to_string(i), &tmp);
-    if (status.IsTooManyOpenFiles()) {
+    auto ec = db->Get({}, std::to_string(i), &tmp);
+    if (ec == std::errc::too_many_files_open) {
       db->CloseFiles();
     } else {
-      INFO(status.Message());
-      REQUIRE(status);
+      INFO(ec.message());
+      REQUIRE_FALSE(ec);
       CHECK(tmp == s);
       ++i;
     }

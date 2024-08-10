@@ -19,75 +19,6 @@ struct iovec;
 
 namespace bitcask {
 
-class Status {
-  enum class Code {
-    kSuccess = 0,
-    /// Requested entity was not found.
-    kNotFound,
-    /// Requested operation already in progress.
-    kInProgress,
-    /// Invalid argument.
-    kInvalidArgument,
-    /// IO error.
-    kIOError,
-    /// Inconsistent state of the database.
-    kInconsistent,
-    /// Database was opened in read-only mode.
-    kReadOnly,
-  };
-
- public:
-  constexpr Status() noexcept = default;
-
-  static constexpr Status Success() noexcept { return Status(); }
-
-  static constexpr Status Inconsistent() noexcept { return Status(Code::kInconsistent); }
-
-  static constexpr Status InProgress() noexcept { return Status(Code::kInProgress); }
-
-  static constexpr Status InvalidArgument() noexcept { return Status(Code::kInvalidArgument); }
-
-  static constexpr Status NotFound() noexcept { return Status(Code::kNotFound); }
-
-  static constexpr Status IOError(int errnum) noexcept { return Status(Code::kIOError, errnum); }
-
-  static constexpr Status ReadOnly() noexcept { return Status(Code::kReadOnly); }
-
-  std::string Message() const;
-
- public:
-  /// Returns true if the status indicates InProgress error.
-  constexpr bool IsInProgress() const noexcept { return code_ == Code::kInProgress; }
-
-  /// Returns true if the status indicates InvalidArgument error.
-  constexpr bool IsInvalidArgument() const noexcept { return code_ == Code::kInvalidArgument; }
-
-  /// Returns true if the status indicates a NotFound error.
-  constexpr bool IsNotFound() const noexcept { return code_ == Code::kNotFound; }
-
-  /// Returns true if the status indicates success.
-  constexpr bool IsSuccess() const noexcept { return code_ == Code::kSuccess; }
-
-  /// Returns true if the status indicates an IO error.
-  constexpr bool IsIOError() const noexcept { return code_ == Code::kIOError; }
-
-  /// Returns true if the status indicates an IO error due to too many open files.
-  constexpr bool IsTooManyOpenFiles() const noexcept { return code_ == Code::kIOError && errno_ == EMFILE; }
-
-  /// Returns true if the status indicates read-only mode.
-  constexpr bool IsReadOnly() const noexcept { return code_ == Code::kReadOnly; }
-
-  explicit constexpr operator bool() const noexcept { return IsSuccess(); }
-
- private:
-  constexpr Status(Code code, int errnum = 0) noexcept : code_(code), errno_(errnum) {}
-
- private:
-  Code code_{Code::kSuccess};
-  /// System error number.
-  int errno_{0};
-};
-
 struct Options {
   /// Number of active files.
   uint8_t active_files = 1;
@@ -179,7 +110,7 @@ class Database {
      * @param parts scatter parts of the data to write.
      * @param sync if true, fsync will be called after write.
      */
-    Status Append(const std::span<const iovec>& parts, const bool sync) noexcept;
+    std::error_code Append(const std::span<const iovec>& parts, const bool sync) noexcept;
 
     /**
      * Waits for the completion of all ongoing reads and closes the file descriptor.
@@ -193,7 +124,7 @@ class Database {
     /**
      * Checks file is opened otherwise opens it in read-only mode.
      */
-    Status EnsureReadable();
+    std::error_code EnsureReadable();
   };
 
   struct FileSections {
@@ -219,23 +150,24 @@ class Database {
   static_assert(std::is_trivial_v<Record>);
   static_assert(sizeof(Record) == sizeof(void*) + 16);
 
-  using FileInfoStatus = std::pair<std::shared_ptr<FileInfo>, Status>;
+  using FileInfoStatus = std::pair<std::shared_ptr<FileInfo>, std::error_code>;
 
  public:
   ~Database();
 
-  static Status Open(
+  static std::error_code Open(
       const Options& options, const std::filesystem::path& path, std::unique_ptr<Database>& db);
 
  public:
-  Status Delete(const WriteOptions& options, const std::string_view key);
+  std::error_code Delete(const WriteOptions& options, const std::string_view key);
 
   void Enumerate(const std::function<void(const std::string_view)>& cb) const;
 
-  Status Get(const ReadOptions& options, const std::string_view key, std::string* value) const;
+  std::error_code Get(const ReadOptions& options, const std::string_view key, std::string* value) const;
 
   /// Put an object into the database.
-  Status Put(const WriteOptions& options, const std::string_view key, const std::string_view value);
+  std::error_code Put(
+      const WriteOptions& options, const std::string_view key, const std::string_view value);
 
  public:
   /**
@@ -243,19 +175,19 @@ class Database {
    */
   void CloseFiles();
 
-  Status Pack(bool force = false);
+  std::error_code Pack(bool force = false);
 
   /// Closes current active files.
-  Status Rotate();
+  std::error_code Rotate();
 
  private:
   Database(const Options& options, const std::filesystem::path& path);
 
-  Status Initialize();
+  std::error_code Initialize();
 
   bool IsLastCompactionLevel(const size_t i) const noexcept;
 
-  Status PackFiles(
+  std::error_code PackFiles(
       const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int slot);
 
  private:
@@ -271,14 +203,16 @@ class Database {
   void WaitKeyUnlocked(const std::string_view key, std::shared_lock<std::shared_mutex>& lock) const;
 
  private:
-  Status EnumerateIndex(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
-      const std::function<Status(const Record&, const bool, std::string_view)>& cb) const;
+  std::error_code EnumerateIndex(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
+      const std::function<std::error_code(const Record&, const bool, std::string_view)>& cb) const;
 
-  Status EnumerateEntries(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
-      const std::function<Status(const Record&, const bool, std::string_view, std::string_view)>& cb) const;
+  std::error_code EnumerateEntries(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
+      const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>&
+          cb) const;
 
-  Status EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
-      const std::function<Status(const Record&, const bool, std::string_view, std::string_view)>& cb) const;
+  std::error_code EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
+      const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>&
+          cb) const;
 
   /**
    * Checks whether the appending block would exceed the file's capacity.
@@ -299,25 +233,35 @@ class Database {
    */
   FileInfoStatus MakeWritableFile(const std::string& name, bool with_footer) const;
 
-  Status ReadValue(const ReadOptions& options, const Record& record, std::string& value) const;
+  /**
+   * Reads a value.
+   */
+  std::error_code ReadValue(const ReadOptions& options, const Record& record, std::string& value) const;
 
   /**
    * Writes the data to the active data file.
    *
    * @returns written record or an error code if the write was unseccessful.
    */
-  std::pair<Record, Status> WriteEntry(const std::string_view key, const std::string_view value,
+  std::pair<Record, std::error_code> WriteEntry(const std::string_view key, const std::string_view value,
       const uint64_t timestamp, const bool is_tombstone, const bool sync);
 
-  Status WriteIndex(const std::shared_ptr<FileInfo>& file);
+  /**
+   * Appends index to the end of file.
+   */
+  std::error_code WriteIndex(const std::shared_ptr<FileInfo>& file);
 
  private:
-  static Status LoadFileSections(const std::shared_ptr<FileInfo>& file, FileSections* sections);
+  static std::error_code LoadFileSections(const std::shared_ptr<FileInfo>& file, FileSections* sections);
 
   static std::optional<int> ParseLayoutIndex(std::string_view name);
 
-  /// @brief Writes record to the data file provided by \p cb
-  static std::pair<Record, Status> WriteEntryToFile(const std::string_view key,
+  /**
+   * Writes a record to a data file provided by \p cb
+   *
+   * @returns Descriptor of the written record or an error code if the write was unsuccessful.
+   */
+  static std::pair<Record, std::error_code> WriteEntryToFile(const std::string_view key,
       const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync,
       const std::function<FileInfoStatus(uint64_t)>& cb);
 
