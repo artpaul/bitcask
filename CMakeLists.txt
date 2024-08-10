@@ -33,9 +33,11 @@ add_library(bitcask STATIC)
 target_sources(bitcask
   PUBLIC
     "include/bitcask/bitcask.h"
+    "include/bitcask/errors.h"
     "include/bitcask/format.h"
   PRIVATE
     "src/bitcask.cc"
+    "src/errors.cc"
     "src/util.h"
     "src/xxhash.h"
 )

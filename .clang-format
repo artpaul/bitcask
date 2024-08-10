@@ -3,6 +3,7 @@ Language: Cpp
 BasedOnStyle: Google
 
 AlignAfterOpenBracket: DontAlign
+BreakConstructorInitializers: BeforeComma
 ColumnLimit: 108
 FixNamespaceComments: true
 PointerAlignment: Left
