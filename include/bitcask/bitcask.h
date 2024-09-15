@@ -54,6 +54,17 @@ struct ReadOptions {
 };
 
 /**
+ * Options that control repair operation.
+ */
+struct RepairOptions {
+  /// Keep corrupted files intact after extracting valid data.
+  bool keep_corrupted_files = false;
+
+  /// Extract all possible data from .tmp files.
+  bool process_temporaries = true;
+};
+
+/**
  * Options that control write operations.
  */
 struct WriteOptions {
@@ -160,6 +171,16 @@ class Database {
 
   static std::error_code Open(
       const Options& options, const std::filesystem::path& path, std::unique_ptr<Database>& db);
+
+  /**
+   * @brief Tries to repair a database.
+   *
+   * @param options repair options.
+   * @param path path to the database.
+   *
+   * @returns std::error_code status of the operation.
+   */
+  static std::error_code Repair(const RepairOptions& options, const std::filesystem::path& path);
 
  public:
   std::error_code Delete(const WriteOptions& options, const std::string_view key);

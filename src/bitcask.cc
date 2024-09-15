@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <numeric>
 
 #include "bitcask/errors.h"
@@ -96,6 +97,7 @@ std::pair<size_t, std::error_code> ReadEntryImpl(const int fd, const size_t offs
     };
 
     if (Hash64(std::span(parts)) != crc) {
+      std::cerr << "ReadEntryImpl\n";
       return {{}, MakeErrorCode(BitcaskError::kInconsistent)};
     }
   }
@@ -205,6 +207,12 @@ std::error_code Database::Open(
   db = std::unique_ptr<Database>(new Database(options, path));
   // Scan database directory.
   return db->Initialize();
+}
+
+std::error_code Database::Repair(const RepairOptions& options, const std::filesystem::path& path) {
+  // list files.
+  // read each file and check for corruption
+  // read as mutch data as possible for the corrupted files
 }
 
 std::error_code Database::Delete(const WriteOptions& options, const std::string_view key) {
@@ -499,9 +507,9 @@ std::error_code Database::Initialize() {
     clock_ = std::max<uint64_t>(clock_, record.timestamp);
     // Count entries.
     if (is_tombstone) {
-      record.file->tombstones.fetch_add(1);
+      record.file->tombstones.fetch_add(1, std::memory_order_relaxed);
     } else {
-      record.file->records.fetch_add(1);
+      record.file->records.fetch_add(1, std::memory_order_relaxed);
     }
 
     const auto ti = tombstones.find(key);
@@ -515,7 +523,7 @@ std::error_code Database::Initialize() {
 
       if (auto ki = keys_.find(key); ki != keys_.end()) {
         if (ki->second.timestamp < record.timestamp) {
-          ki->second.file->obsolete.fetch_add(1);
+          ki->second.file->obsolete.fetch_add(1, std::memory_order_relaxed);
           keys_.erase(ki);
         }
       }
@@ -525,14 +533,14 @@ std::error_code Database::Initialize() {
 
     // The record will be deleted in the future. Skip it.
     if (ti != tombstones.end() && record.timestamp < ti->second) {
-      record.file->obsolete.fetch_add(1);
+      record.file->obsolete.fetch_add(1, std::memory_order_relaxed);
       return {};
     }
 
     if (const auto ki = keys_.find(key); ki == keys_.end()) {
       keys_.emplace(key, record);
     } else if (ki->second.timestamp < record.timestamp) {
-      ki->second.file->obsolete.fetch_add(1);
+      ki->second.file->obsolete.fetch_add(1, std::memory_order_relaxed);
       ki->second = record;
     }
 
@@ -557,6 +565,7 @@ std::error_code Database::Initialize() {
   };
 
   for (const auto& entry : std::filesystem::directory_iterator(base_path_)) {
+    std::cerr << entry.path() << "\n";
     if (!entry.is_regular_file()) {
       continue;
     }
@@ -716,7 +725,8 @@ std::error_code Database::PackFiles(
       // Ensure that all data has been written to the storage device
       // before deleting the source files.
       f->CloseFile(true);
-      // Rename temporary file.
+      // abort();
+      //  Rename temporary file.
       if (auto ec = rename_temporary(f)) {
         return ec;
       }
@@ -824,6 +834,7 @@ std::error_code Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file,
         iovec{.iov_base = key.data(), .iov_len = key.size()},
     };
     if (Hash64(std::span(parts)) != crc) {
+      std::cerr << "EnumerateIndex\n";
       return MakeErrorCode(BitcaskError::kInconsistent);
     }
 
@@ -1037,6 +1048,7 @@ std::error_code Database::LoadFileSections(const std::shared_ptr<FileInfo>& file
       return ec;
     }
     if (footer.entries > footer.index) {
+      std::cerr << "LoadFileSections\n";
       return MakeErrorCode(BitcaskError::kInconsistent);
     }
 
