@@ -19,8 +19,8 @@
 namespace {
 
 constexpr bitcask::Options kDefaultOptions{
-    .compaction_levels = 1,
     .max_file_size = 32ull << 20,
+    .compaction_levels = 1,
 };
 
 } // namespace
@@ -130,7 +130,7 @@ TEST_CASE("Read after reopen") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
   auto options = kDefaultOptions;
-  options.data_sync = true;
+  options.flush_mode = bitcask::FlushMode::kImmediately;
 
   REQUIRE_FALSE(bitcask::Database::Open(options, temp_dir.GetPath(), db));
   REQUIRE_FALSE(db->Put({}, "abc", "test"));
@@ -232,6 +232,35 @@ TEST_CASE("Write multiple active files") {
   std::string tmp;
   REQUIRE_FALSE(db->Get({.verify_checksums = true}, std::to_string(512), &tmp));
   CHECK(tmp == "some content larger than header512");
+}
+
+TEST_CASE("Flush with delay") {
+  TemporaryDirectory temp_dir;
+  std::unique_ptr<bitcask::Database> db;
+
+  REQUIRE_FALSE(bitcask::Database::Open(
+      {.flush_mode = bitcask::FlushMode::kDelay, .max_file_size = 16 << 10}, temp_dir.GetPath(), db));
+
+  std::vector<std::thread> threads;
+  const std::string value = "some content larger than header";
+  const auto do_write = [&] {
+    for (size_t i = rand() % 10; i < 50; ++i) db->Put({}, std::to_string(i), value);
+  };
+
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_write);
+  threads.emplace_back(do_write);
+
+  for (auto& t : threads) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+  std::string tmp;
+  auto s = db->Get({}, "12", &tmp);
+  CHECK(tmp == value);
 }
 
 TEST_CASE("Write single key by multiple threads") {

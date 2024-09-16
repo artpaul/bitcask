@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -19,19 +20,31 @@ struct iovec;
 
 namespace bitcask {
 
+enum class FlushMode {
+  kNone = 0,
+  /// Flush in-core data only when closing an active file.
+  kOnClose,
+  /// Delay flushing of the written data.
+  kDelay,
+  /// Flush in-core data after each write.
+  kImmediately,
+};
+
 struct Options {
   /// Number of active files.
   uint8_t active_files = 1;
 
-  uint8_t compaction_levels = 2;
+  /// Mode of flushing in-core data to storage device.
+  FlushMode flush_mode = FlushMode::kNone;
+
+  std::chrono::nanoseconds flush_delay = std::chrono::milliseconds(1);
 
   uint32_t max_file_size = std::numeric_limits<uint32_t>::max();
 
+  uint8_t compaction_levels = 2;
+
   /// If the database has been loaded successfully, clean up any temporary files at startup.
   bool clean_temporary_on_startup = true;
-
-  /// Flush in-core data to storage device after write.
-  bool data_sync = false;
 
   /// If true, the store will be opened in read-only mode.
   bool read_only = false;
@@ -69,6 +82,26 @@ class Database {
     kScatter = 1,
     /// Gather multiple data files into single one.
     kGather = 2,
+  };
+
+  struct FileInfo;
+  struct WaitQueue;
+
+  struct ActiveFile {
+    /// Provides exclusive access for writing to the active file.
+    std::mutex write_mutex;
+    /// A file object designated for writing.
+    std::shared_ptr<FileInfo> file;
+
+    std::chrono::steady_clock::time_point last_write;
+    // Wait queue for delayed flushes.
+    std::weak_ptr<WaitQueue> wait_queue;
+
+   public:
+    std::error_code FlushWithDelay(
+        const std::chrono::nanoseconds delay, std::unique_lock<std::mutex> write_lock);
+
+    bool MaybeFlushImmediately(const std::chrono::nanoseconds delay);
   };
 
   struct FileInfo {
@@ -128,6 +161,15 @@ class Database {
      * Checks file is opened otherwise opens it in read-only mode.
      */
     std::error_code EnsureReadable();
+  };
+
+  struct WaitQueue {
+    std::condition_variable cond;
+    std::promise<std::error_code> promise;
+    std::shared_future<std::error_code> result;
+
+   public:
+    WaitQueue() : result(promise.get_future()) {}
   };
 
   struct FileSections {
@@ -247,7 +289,7 @@ class Database {
    * @returns Descriptor of the written record or an error code if the write was unsuccessful.
    */
   std::pair<Record, std::error_code> WriteEntry(const std::string_view key, const std::string_view value,
-      const uint64_t timestamp, const bool is_tombstone, const bool sync);
+      const uint64_t timestamp, const bool is_tombstone, const FlushMode flush_mode);
 
   /**
    * Appends index to the end of file.
@@ -269,13 +311,6 @@ class Database {
       const std::function<FileInfoStatus(uint64_t)>& cb);
 
  private:
-  struct ActiveFile {
-    /// Provides exclusive access for writing to the active file.
-    std::mutex write_mutex;
-    /// A file object designated for writing.
-    std::shared_ptr<FileInfo> file;
-  };
-
   struct StringHash {
     using is_transparent = void;
 
