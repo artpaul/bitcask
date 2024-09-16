@@ -105,6 +105,53 @@ std::pair<size_t, std::error_code> ReadEntryImpl(const int fd, const size_t offs
 
 } // namespace
 
+std::error_code Database::ActiveFile::FlushWithDelay(
+    const std::chrono::nanoseconds delay, std::unique_lock<std::mutex> write_lock) {
+  // Check the thread is ownign the lock.
+  assert(write_lock.owns_lock());
+
+  auto queue = wait_queue.lock();
+
+  if (queue) {
+    write_lock.unlock();
+    // Wait for the result.
+    return queue->result.get();
+  } else {
+    this->wait_queue = (queue = std::make_shared<WaitQueue>());
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + delay;
+  // Wait until deadline.
+  while (queue->cond.wait_until(write_lock, deadline) != std::cv_status::timeout) {
+    if (!file) {
+      break;
+    }
+  }
+
+  std::error_code e;
+  // Flush the data if the file is still writeable.
+  if (file) {
+    if (int ret = ::fsync(file->fd); ret != 0) {
+      e = std::make_error_code(static_cast<std::errc>(errno));
+    }
+  }
+  // Notify other waitees.
+  queue->promise.set_value(e);
+  // Reset the queue.
+  this->wait_queue = {};
+
+  return e;
+}
+
+bool Database::ActiveFile::MaybeFlushImmediately(const std::chrono::nanoseconds delay) {
+  const auto now = std::chrono::steady_clock::now();
+  const bool result = (now - last_write) > delay;
+
+  last_write = now;
+
+  return result;
+}
+
 std::error_code Database::FileInfo::Append(const std::span<const iovec>& parts, const bool sync) noexcept {
   const size_t length = std::accumulate(
       parts.begin(), parts.end(), 0ul, [](const auto acc, const auto& p) { return acc + p.iov_len; });
@@ -191,7 +238,7 @@ Database::~Database() {
   // Close writable files.
   for (const auto& item : active_files_) {
     if (item.file) {
-      item.file->CloseFile(options_.data_sync);
+      item.file->CloseFile(options_.flush_mode != FlushMode::kNone);
     }
   }
   // Close read-only files.
@@ -232,8 +279,13 @@ std::error_code Database::Delete(const WriteOptions& options, const std::string_
   }
 
   [[maybe_unused]] Defer d([this, key] { UnlockKey(key); });
+  //
+  const auto flush_mode = (options.sync && (options_.flush_mode == FlushMode::kNone ||
+                                               options_.flush_mode == FlushMode::kOnClose))
+                              ? FlushMode::kImmediately
+                              : options_.flush_mode;
   // Write the tombstone.
-  auto [_, ec] = WriteEntry(key, {}, timestamp.value(), true, options.sync);
+  auto [_, ec] = WriteEntry(key, {}, timestamp.value(), true, flush_mode);
   if (ec) {
     return ec;
   }
@@ -315,8 +367,13 @@ std::error_code Database::Put(
   const uint64_t timestamp = ++clock_;
 
   [[maybe_unused]] Defer d([this, key] { UnlockKey(key); });
+  //
+  const auto flush_mode = (options.sync && (options_.flush_mode == FlushMode::kNone ||
+                                               options_.flush_mode == FlushMode::kOnClose))
+                              ? FlushMode::kImmediately
+                              : options_.flush_mode;
   // Write the value with the specific timestamp.
-  auto [record, ec] = WriteEntry(key, value, timestamp, false, options.sync);
+  auto [record, ec] = WriteEntry(key, value, timestamp, false, flush_mode);
   if (ec) {
     return ec;
   }
@@ -472,6 +529,10 @@ std::error_code Database::Rotate() {
   for (auto& item : active_files_) {
     // Acquire exclusive access for writing to active file.
     std::lock_guard write_lock(item.write_mutex);
+    //
+    if (auto wait_queue = item.wait_queue.lock()) {
+      wait_queue->cond.notify_all();
+    }
     // Check if there is a file opened for writing.
     if (item.file) {
       files.push_back(std::move(item.file));
@@ -480,7 +541,7 @@ std::error_code Database::Rotate() {
 
   // Close files for writing.
   for (const auto& f : files) {
-    f->CloseFile(options_.data_sync);
+    f->CloseFile(options_.flush_mode != FlushMode::kNone);
   }
   // Acquire exclusive access to the list of data files.
   std::lock_guard file_lock(file_mutex_);
@@ -947,7 +1008,7 @@ std::error_code Database::ReadValue(
 }
 
 std::pair<Database::Record, std::error_code> Database::WriteEntry(const std::string_view key,
-    const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync) {
+    const std::string_view value, const uint64_t timestamp, const bool is_tombstone, FlushMode flush_mode) {
   ActiveFile& active_file = active_files_.size() == 1
                                 ? active_files_[0]
                                 : active_files_[XXH64(key.data(), key.size(), 0) % active_files_.size()];
@@ -962,7 +1023,10 @@ std::pair<Database::Record, std::error_code> Database::WriteEntry(const std::str
     // is not enough space left for writing.
     if (active_file.file) {
       if (IsCapacityExceeded(active_file.file->size, length)) {
-        active_file.file->CloseFile(sync);
+        active_file.file->CloseFile(flush_mode != FlushMode::kNone);
+        if (auto wait_queue = active_file.wait_queue.lock()) {
+          wait_queue->cond.notify_all();
+        }
 
         // Acquire exclusive access to list of data files.
         std::lock_guard file_lock(file_mutex_);
@@ -985,7 +1049,18 @@ std::pair<Database::Record, std::error_code> Database::WriteEntry(const std::str
     return {active_file.file, {}};
   };
 
-  return WriteEntryToFile(key, value, timestamp, is_tombstone, sync, file_provider);
+  if (flush_mode == FlushMode::kDelay && active_file.MaybeFlushImmediately(options_.flush_delay)) {
+    flush_mode = FlushMode::kImmediately;
+  }
+
+  auto [record, ec] = WriteEntryToFile(
+      key, value, timestamp, is_tombstone, flush_mode == FlushMode::kImmediately, file_provider);
+  // Return any error immediately.
+  if (ec || flush_mode != FlushMode::kDelay) {
+    return {record, ec};
+  }
+
+  return {record, active_file.FlushWithDelay(options_.flush_delay, std::move(write_lock))};
 }
 
 std::error_code Database::WriteIndex(const std::shared_ptr<FileInfo>& file) {
@@ -1106,9 +1181,9 @@ std::pair<Database::Record, std::error_code> Database::WriteEntryToFile(const st
 
   // Count entries.
   if (is_tombstone) {
-    file->tombstones.fetch_add(1);
+    file->tombstones.fetch_add(1, std::memory_order_relaxed);
   } else {
-    file->records.fetch_add(1);
+    file->records.fetch_add(1, std::memory_order_relaxed);
   }
 
   const Record record{
