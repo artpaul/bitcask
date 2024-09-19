@@ -117,6 +117,8 @@ class Database {
     std::mutex fd_mutex;
     /// File descriptor.
     int fd{-1};
+    /// The file may have partially written record at the end.
+    const bool may_have_uncommitted;
 
     /// Total size of the file.
     /// The size is only updated on writing or set on loading.
@@ -131,7 +133,8 @@ class Database {
     std::atomic_uint64_t tombstones{0};
 
    public:
-    FileInfo(std::filesystem::path p, uint64_t s) noexcept : path(std::move(p)), size(s) {}
+    FileInfo(std::filesystem::path p, uint64_t s, bool uncommitted) noexcept
+        : path(std::move(p)), may_have_uncommitted(uncommitted), size(s) {}
 
 #ifndef NDEBUG
     ~FileInfo() {
@@ -251,6 +254,11 @@ class Database {
   std::error_code EnumerateIndex(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
       const std::function<std::error_code(const Record&, const bool, std::string_view)>& cb) const;
 
+  /**
+   * Enumerates all entries in a file.
+   *
+   * @param file a file to enumerate.
+   */
   std::error_code EnumerateEntries(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
       const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>&
           cb) const;

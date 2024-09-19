@@ -61,7 +61,15 @@ std::error_code LoadFromFile(int fd, void* buf, size_t len, size_t& off) noexcep
   return {};
 }
 
-/// Reads full content of an entry.
+/**
+ * Reads full content of an entry.
+ *
+ * @param fd
+ * @param offset beginning of the entry.
+ * @param check_crc check consistency of read data.
+ *
+ * @returns bytes read or an error code.
+ */
 std::pair<size_t, std::error_code> ReadEntryImpl(const int fd, const size_t offset, const bool check_crc,
     format::Entry& entry, std::string& key, std::string& value) {
   size_t current_offset = offset;
@@ -633,7 +641,7 @@ std::error_code Database::Initialize() {
       continue;
     }
 
-    auto file = std::make_shared<FileInfo>(entry.path(), entry.file_size());
+    auto file = std::make_shared<FileInfo>(entry.path(), entry.file_size(), index.value() == 0);
     // Open file for reading.
     if (auto ec = file->EnsureReadable()) {
       return ec;
@@ -644,6 +652,12 @@ std::error_code Database::Initialize() {
       if (IsNotFound(ec)) {
         continue;
       }
+      // A former active file may have a partially written record at the end in case of unexpected shutdown.
+      // Ignore it.
+      if (IsUnexpectedEndOfFile(ec) && file->may_have_uncommitted) {
+        continue;
+      }
+
       return ec;
     }
 
@@ -761,6 +775,12 @@ std::error_code Database::PackFiles(
     }
     // Enumerate all records in the source file.
     if (auto ec = EnumerateEntriesNoLock(file, cb)) {
+      // A former active file may have a partially written record at the end in case of unexpected shutdown.
+      // Ignore it.
+      if (IsUnexpectedEndOfFile(ec) && file->may_have_uncommitted) {
+        continue;
+      }
+
       read_lock.unlock();
       // TODO: finalize.
       return ec;
@@ -978,7 +998,7 @@ Database::FileInfoStatus Database::MakeWritableFile(const std::string& name, boo
       return {{}, std::make_error_code(static_cast<std::errc>(err))};
     }
   }
-  auto file = std::make_shared<FileInfo>(std::move(path), sizeof(format::Header));
+  auto file = std::make_shared<FileInfo>(std::move(path), sizeof(format::Header), name.starts_with("0-"));
   file->fd = fd;
   return {file, {}};
 }
