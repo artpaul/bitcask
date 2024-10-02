@@ -409,6 +409,10 @@ std::error_code Database::Put(
   return {};
 }
 
+uint64_t Database::ApproximateSpaceUsed() const noexcept {
+  return std::max(int64_t(0), space_used_.load(std::memory_order_relaxed));
+}
+
 void Database::CloseFiles() {
   std::lock_guard file_lock(file_mutex_);
 
@@ -511,15 +515,17 @@ std::error_code Database::Pack(bool force) {
           files_[i].end(), std::make_move_iterator(files.begin()), std::make_move_iterator(files.end()));
 
       return ec;
-    } else {
-      // Cleanup processed files.
-      for (const auto& file : files) {
-        assert(file.use_count() == 1);
+    }
 
-        file->CloseFile();
-        // Remove processed file from the storage device.
-        std::filesystem::remove(file->path);
-      }
+    // Cleanup processed files.
+    for (const auto& file : files) {
+      assert(file.use_count() == 1);
+
+      file->CloseFile();
+      // Adjust counter of used space.
+      space_used_.fetch_sub(file->size, std::memory_order_relaxed);
+      // Remove processed file from the storage device.
+      std::filesystem::remove(file->path);
     }
   }
 
@@ -661,6 +667,8 @@ std::error_code Database::Initialize() {
       return ec;
     }
 
+    // Adjust the counter of space used.
+    space_used_.fetch_add(file->size, std::memory_order_relaxed);
     // Move data file into the read-only set.
     if (index.value() >= compaction_slots_count_) {
       files_[0].push_back(std::move(file));
@@ -816,6 +824,11 @@ std::error_code Database::PackFiles(
   std::lock_guard file_lock(file_mutex_);
   // 4. Append output files to LSM-tree.
   for (size_t i = 0, end = output.size(); i != end; ++i) {
+    // Adjust the counter of space used.
+    for (const auto& f : output[i]) {
+      space_used_.fetch_add(f->size, std::memory_order_relaxed);
+    }
+
     files_[1 + i].insert(files_[1 + i].end(), output[i].begin(), output[i].end());
   }
 
@@ -1197,6 +1210,8 @@ std::pair<Database::Record, std::error_code> Database::WriteEntryToFile(const st
   // Write data to the file.
   if (auto ec = file->Append(parts, sync)) {
     return {{}, ec};
+  } else {
+    space_used_.fetch_add(length, std::memory_order_relaxed);
   }
 
   // Count entries.
