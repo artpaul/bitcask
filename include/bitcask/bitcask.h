@@ -219,13 +219,20 @@ class Database {
 
  public:
   /**
+   * @Approximate value of the space occupied by data files.
+   */
+  uint64_t ApproximateSpaceUsed() const noexcept;
+
+  /**
    * Closes all opened read-only files.
    */
   void CloseFiles();
 
   std::error_code Pack(bool force = false);
 
-  /// Closes current active files.
+  /**
+   * Closes current active files.
+   */
   std::error_code Rotate();
 
  private:
@@ -300,6 +307,15 @@ class Database {
       const uint64_t timestamp, const bool is_tombstone, const FlushMode flush_mode);
 
   /**
+   * Writes a record to a data file provided by \p cb
+   *
+   * @returns Descriptor of the written record or an error code if the write was unsuccessful.
+   */
+  std::pair<Record, std::error_code> WriteEntryToFile(const std::string_view key,
+      const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync,
+      const std::function<FileInfoStatus(uint64_t)>& cb);
+
+  /**
    * Appends index to the end of file.
    */
   std::error_code WriteIndex(const std::shared_ptr<FileInfo>& file);
@@ -308,15 +324,6 @@ class Database {
   static std::error_code LoadFileSections(const std::shared_ptr<FileInfo>& file, FileSections* sections);
 
   static std::optional<int> ParseLayoutIndex(std::string_view name);
-
-  /**
-   * Writes a record to a data file provided by \p cb
-   *
-   * @returns Descriptor of the written record or an error code if the write was unsuccessful.
-   */
-  static std::pair<Record, std::error_code> WriteEntryToFile(const std::string_view key,
-      const std::string_view value, const uint64_t timestamp, const bool is_tombstone, const bool sync,
-      const std::function<FileInfoStatus(uint64_t)>& cb);
 
  private:
   struct StringHash {
@@ -367,6 +374,9 @@ class Database {
   mutable std::mutex file_mutex_;
   /// Ln read-only data files.
   std::vector<std::vector<std::shared_ptr<FileInfo>>> files_;
+
+  /// Approximate value of the space occupied by data files.
+  std::atomic_int64_t space_used_{0};
 };
 
 } // namespace bitcask
