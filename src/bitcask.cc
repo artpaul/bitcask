@@ -795,6 +795,10 @@ std::error_code Database::PackFiles(
       // TODO: finalize.
       return ec;
     }
+
+    read_lock.unlock();
+    // Close the file to avoid possible exhaustion of available file handles.
+    file->CloseFile();
   }
 
   // 2. Finalize output files.
