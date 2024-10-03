@@ -698,6 +698,8 @@ std::error_code Database::PackFiles(
 
   static_assert(std::is_trivially_destructible_v<decltype(updates)::value_type>);
 
+  const auto get_scatter_slot = [&](const size_t i) { return (slot * 8 + 1) + i; };
+
   const auto cb = [&](const Record& record, const bool is_tombstone, const std::string_view key,
                       const std::string_view value) -> std::error_code {
     auto ki = keys_.find(key);
@@ -729,7 +731,7 @@ std::error_code Database::PackFiles(
 
           if (mode == CompactionMode::kScatter) {
             i = XXH64(key.data(), key.size(), slot + 1) % 8;
-            index = (slot * 8 + 1) + i;
+            index = get_scatter_slot(i);
           }
 
           if (output[i].empty() || IsCapacityExceeded(output[i].back()->size, length)) {
@@ -824,12 +826,15 @@ std::error_code Database::PackFiles(
   std::lock_guard file_lock(file_mutex_);
   // 4. Append output files to LSM-tree.
   for (size_t i = 0, end = output.size(); i != end; ++i) {
+    const auto index = (mode == CompactionMode::kGather) ? slot : get_scatter_slot(i);
+
     // Adjust the counter of space used.
     for (const auto& f : output[i]) {
       space_used_.fetch_add(f->size, std::memory_order_relaxed);
     }
 
-    files_[1 + i].insert(files_[1 + i].end(), output[i].begin(), output[i].end());
+    files_[index].insert(files_[index].end(), std::make_move_iterator(output[i].begin()),
+        std::make_move_iterator(output[i].end()));
   }
 
   return {};
