@@ -696,6 +696,20 @@ std::error_code Database::PackFiles(
   std::vector<std::vector<std::shared_ptr<FileInfo>>> output(8);
   std::vector<std::pair<decltype(keys_)::iterator, Record>> updates;
 
+  [[maybe_unused]] Defer defer_cleanup([&] {
+    for (const auto& files : output) {
+      for (const auto& f : files) {
+        if (!bool(f)) {
+          continue;
+        }
+        // Adjust the counter of space used.
+        space_used_.fetch_sub(f->size, std::memory_order_relaxed);
+        // Remove temporary file.
+        std::filesystem::remove(f->path);
+      }
+    }
+  });
+
   static_assert(std::is_trivially_destructible_v<decltype(updates)::value_type>);
 
   const auto get_scatter_slot = [&](const size_t i) { return (slot * 8 + 1) + i; };
@@ -790,9 +804,6 @@ std::error_code Database::PackFiles(
       if (IsUnexpectedEndOfFile(ec) && file->may_have_uncommitted) {
         continue;
       }
-
-      read_lock.unlock();
-      // TODO: finalize.
       return ec;
     }
 
@@ -806,7 +817,9 @@ std::error_code Database::PackFiles(
     for (const auto& f : output[i]) {
       // Append index at the end of file.
       if (options_.write_index) {
-        WriteIndex(f); // TODO: handle errors.
+        if (auto ec = WriteIndex(f)) {
+          return ec;
+        }
       }
       // Ensure that all data has been written to the storage device
       // before deleting the source files.
@@ -832,14 +845,11 @@ std::error_code Database::PackFiles(
   for (size_t i = 0, end = output.size(); i != end; ++i) {
     const auto index = (mode == CompactionMode::kGather) ? slot : get_scatter_slot(i);
 
-    // Adjust the counter of space used.
-    for (const auto& f : output[i]) {
-      space_used_.fetch_add(f->size, std::memory_order_relaxed);
-    }
-
     files_[index].insert(files_[index].end(), std::make_move_iterator(output[i].begin()),
         std::make_move_iterator(output[i].end()));
   }
+  // 5. Cleanup.
+  output.clear();
 
   return {};
 }
