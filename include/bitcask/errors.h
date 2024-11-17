@@ -11,6 +11,8 @@ enum class BitcaskError {
   kInProgress,
   /// Invalid argument.
   kInvalidArgument,
+  /// Invalid range.
+  kInvalidRange,
   /// Inconsistent state of the database.
   kInconsistent,
   /// Database was opened in read-only mode.
@@ -27,6 +29,9 @@ bool IsInProgress(const std::error_code ec) noexcept;
 
 /// Returns true if the error code indicates InvalidArgument error.
 bool IsInvalidArgument(const std::error_code ec) noexcept;
+
+/// Returns true if the error code indicates InvalidRange error.
+bool IsInvalidRange(const std::error_code ec) noexcept;
 
 /// Returns true if the error code indicates data inconsistency.
 bool IsInconsistent(const std::error_code ec) noexcept;

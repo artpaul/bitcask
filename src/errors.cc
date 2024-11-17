@@ -17,6 +17,8 @@ class BitcaskErrorCategory : public std::error_category {
         return "In progress";
       case BitcaskError::kInvalidArgument:
         return "Invalid argument";
+      case BitcaskError::kInvalidRange:
+        return "Invalid range";
       case BitcaskError::kReadOnly:
         return "Readn only";
       case BitcaskError::kUnexpectedEndOfFile:
@@ -40,6 +42,10 @@ bool IsInProgress(const std::error_code ec) noexcept {
 
 bool IsInvalidArgument(const std::error_code ec) noexcept {
   return ec == std::error_code(static_cast<int>(BitcaskError::kInvalidArgument), kErrorCategory);
+}
+
+bool IsInvalidRange(const std::error_code ec) noexcept {
+  return ec == std::error_code(static_cast<int>(BitcaskError::kInvalidRange), kErrorCategory);
 }
 
 bool IsInconsistent(const std::error_code ec) noexcept {
