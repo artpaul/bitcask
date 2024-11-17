@@ -1040,6 +1040,17 @@ std::error_code Database::ReadValue(
   // Acquiring read lock to prevent closing the file handle during the read.
   std::shared_lock read_lock(record.file->read_mutex);
 
+  // Ensure the reading range is valid.
+  if (const auto& range = options.range) {
+    if (range->size > record.size || range->offset > record.size - range->size) {
+      return MakeErrorCode(BitcaskError::kInvalidRange);
+    }
+    // Return an empty value if the size of the range is zero.
+    if (range->size == 0) [[unlikely]] {
+      value.clear();
+      return {};
+    }
+  }
   // Ensure file is opened.
   if (auto ec = record.file->EnsureReadable()) {
     return ec;
@@ -1049,11 +1060,24 @@ std::error_code Database::ReadValue(
     size_t offset = record.offset;
     format::Entry e;
     std::string key;
-    return ReadEntryImpl(record.file->fd, offset, true, e, key, value).second;
+
+    if (auto ec = ReadEntryImpl(record.file->fd, offset, true, e, key, value).second) {
+      return ec;
+    }
+    if (const auto& range = options.range) {
+      value.assign(value.data() + range->offset, range->size);
+    }
+    return {};
   } else {
     size_t offset = record.offset + (sizeof(uint64_t) + sizeof(format::Entry));
     // Allocate memory for the value.
-    value.resize(record.size);
+    if (const auto& range = options.range) {
+      value.resize(range->size);
+      // Adjust reading offset.
+      offset += range->offset;
+    } else {
+      value.resize(record.size);
+    }
     // Load value.
     return LoadFromFile(record.file->fd, value.data(), value.size(), offset);
   }

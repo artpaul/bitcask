@@ -53,6 +53,11 @@ struct Options {
   bool write_index = true;
 };
 
+struct Range {
+  uint32_t offset;
+  uint32_t size;
+};
+
 /**
  * Options that control read operations.
  */
@@ -64,6 +69,9 @@ struct ReadOptions {
   /// If the size of the read value is greater than the specified size, the
   /// operation will fail.
   uint32_t max_value_size = std::numeric_limits<uint32_t>::max();
+
+  /// Subrange of the value to read.
+  std::optional<Range> range{};
 };
 
 /**

@@ -145,6 +145,32 @@ TEST_CASE("Read after reopen") {
   CHECK(value == "text");
 }
 
+TEST_CASE("Read range") {
+  TemporaryDirectory temp_dir;
+  std::unique_ptr<bitcask::Database> db;
+  std::string value;
+
+  REQUIRE_FALSE(bitcask::Database::Open(kDefaultOptions, temp_dir.GetPath(), db));
+
+  REQUIRE_FALSE(db->Put({}, "abc", "test"));
+
+  // Without crc check.
+  REQUIRE_FALSE(db->Get({.range = bitcask::Range{1, 2}}, "abc", &value));
+  CHECK(value == "es");
+  // Without crc check (empty result).
+  REQUIRE_FALSE(db->Get({.range = bitcask::Range{4, 0}}, "abc", &value));
+  CHECK(value == "");
+  // With crc check.
+  REQUIRE_FALSE(db->Get({.verify_checksums = true, .range = bitcask::Range{1, 3}}, "abc", &value));
+  CHECK(value == "est");
+
+  // Invalid range (offset).
+  REQUIRE(db->Get({.range = bitcask::Range{5, 0}}, "abc", &value));
+  // Invalid range (size).
+  REQUIRE(db->Get({.range = bitcask::Range{0, 5}}, "abc", &value));
+  REQUIRE(db->Get({.range = bitcask::Range{1, 4}}, "abc", &value));
+}
+
 TEST_CASE("Record large than max size of file") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
