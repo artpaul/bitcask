@@ -304,7 +304,9 @@ std::error_code Database::Delete(const WriteOptions& options, const std::string_
     const bool present_in_main = keys_.contains(key);
     // During the merging process only the updated_keys_ can be modified.
     if (auto ki = updated_keys_->find(key); ki != updated_keys_->end()) {
-      ki->second.file->obsolete.fetch_add(1);
+      if (ki->second.file) {
+        ki->second.file->obsolete.fetch_add(1);
+      }
       if (present_in_main) {
         ki->second = Record{};
       } else {
@@ -393,7 +395,9 @@ std::error_code Database::Put(
     if (auto ki = updated_keys_->find(key); ki == updated_keys_->end()) {
       updated_keys_->emplace(key, record);
     } else {
-      ki->second.file->obsolete.fetch_add(1);
+      if (ki->second.file) {
+        ki->second.file->obsolete.fetch_add(1);
+      }
       ki->second = record;
     }
 
