@@ -215,13 +215,30 @@ class Database {
       const Options& options, const std::filesystem::path& path, std::unique_ptr<Database>& db);
 
  public:
+  /**
+   * Deletes an object from the database.
+   *
+   * @param key key of the object to delete.
+   */
   std::error_code Delete(const WriteOptions& options, const std::string_view key);
 
+  /**
+   * Lists all objects in the database.
+   */
   void Enumerate(const std::function<void(const std::string_view)>& cb) const;
 
+  /**
+   * Reads an object from the database.
+   *
+   * @param key key of the object to read.
+   */
   std::error_code Get(const ReadOptions& options, const std::string_view key, std::string* value) const;
 
-  /// Put an object into the database.
+  /**
+   * Puts an object into the database.
+   *
+   * @param key key of the object to add.
+   */
   std::error_code Put(
       const WriteOptions& options, const std::string_view key, const std::string_view value);
 

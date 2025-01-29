@@ -288,8 +288,7 @@ std::error_code Database::Delete(const WriteOptions& options, const std::string_
 
   [[maybe_unused]] Defer d([this, key] { UnlockKey(key); });
   //
-  const auto flush_mode = (options.sync && (options_.flush_mode == FlushMode::kNone ||
-                                               options_.flush_mode == FlushMode::kOnClose))
+  const auto flush_mode = (options.sync && (options_.flush_mode != FlushMode::kDelay))
                               ? FlushMode::kImmediately
                               : options_.flush_mode;
   // Write the tombstone.
@@ -378,8 +377,7 @@ std::error_code Database::Put(
 
   [[maybe_unused]] Defer d([this, key] { UnlockKey(key); });
   //
-  const auto flush_mode = (options.sync && (options_.flush_mode == FlushMode::kNone ||
-                                               options_.flush_mode == FlushMode::kOnClose))
+  const auto flush_mode = (options.sync && (options_.flush_mode != FlushMode::kDelay))
                               ? FlushMode::kImmediately
                               : options_.flush_mode;
   // Write the value with the specific timestamp.
