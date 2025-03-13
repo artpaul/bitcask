@@ -43,7 +43,7 @@ struct Entry {
   /// Various flags for the entry.
   uint8_t flags;
 
-  constexpr bool is_tobstone() const noexcept { return (flags & kEntryFlagTombstone) != 0; }
+  constexpr bool is_tombstone() const noexcept { return (flags & kEntryFlagTombstone) != 0; }
 };
 
 struct Index {

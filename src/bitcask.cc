@@ -696,6 +696,8 @@ bool Database::IsLastCompactionLevel(const size_t i) const noexcept {
 std::error_code Database::PackFiles(
     const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int slot) {
   std::vector<std::vector<std::shared_ptr<FileInfo>>> output(8);
+  // Mapping from source to target files.
+  std::vector<std::tuple<unsigned, unsigned, Record, decltype(keys_)::iterator>> remap;
   std::vector<std::pair<decltype(keys_)::iterator, Record>> updates;
 
   [[maybe_unused]] Defer defer_cleanup([&] {
@@ -712,45 +714,108 @@ std::error_code Database::PackFiles(
     }
   });
 
-  static_assert(std::is_trivially_destructible_v<decltype(updates)::value_type>);
+  const auto get_scatter_slot = [slot](const size_t i) { return (slot * 8 + 1) + i; };
 
-  const auto get_scatter_slot = [&](const size_t i) { return (slot * 8 + 1) + i; };
+  // 0. Build remapping.
+  for (size_t i = 0, end = files.size(); i != end; ++i) {
+    const auto& file = files[i];
+    // Acquiring read lock to prevent closing the file handle during the read.
+    std::shared_lock read_lock(file->read_mutex);
 
-  const auto cb = [&](const Record& record, const bool is_tombstone, const std::string_view key,
-                      const std::string_view value) -> std::error_code {
-    auto ki = keys_.find(key);
-    if (ki == keys_.end()) {
-      if (is_tombstone) {
-        if (IsLastCompactionLevel(slot)) {
-          assert(mode == CompactionMode::kGather);
+    // Ensure source file is opened.
+    if (auto ec = file->EnsureReadable()) {
+      return ec;
+    }
+
+    const auto remap_cb = [&](const Record& record, const bool is_tombstone, const std::string_view key,
+                              const std::string_view) -> std::error_code {
+      auto ki = keys_.find(key);
+      if (ki == keys_.end()) {
+        if (is_tombstone) {
+          if (IsLastCompactionLevel(slot)) {
+            assert(mode == CompactionMode::kGather);
+            return {};
+          }
+        } else {
+          // Old key that has already been deleted. Do not retain.
+          return {};
+        }
+      } else if (ki->second.timestamp == record.timestamp) {
+        // The current value or potential data duplication. Keep only the current one.
+        if (ki->second.file != record.file || ki->second.offset != record.offset) {
           return {};
         }
       } else {
-        // Old key that has already been deleted. Do not retain.
+        assert(ki->second.timestamp > record.timestamp);
         return {};
       }
-    } else if (ki->second.timestamp == record.timestamp) {
-      // The current value or potential data duplication. Keep only the current one.
-      if (ki->second.file != record.file || ki->second.offset != record.offset) {
-        return {};
+
+      if (mode == CompactionMode::kScatter) {
+        remap.emplace_back(XXH64(key.data(), key.size(), slot + 1) % 8, i, record, ki);
+      } else {
+        remap.emplace_back(0, i, record, ki);
       }
-    } else {
-      assert(ki->second.timestamp > record.timestamp);
       return {};
+    };
+
+    // Enumerate all records in the source file.
+    if (auto ec = EnumerateEntriesNoLock(file, remap_cb)) {
+      // A former active file may have a partially written record at the end in case of unexpected
+      // shutdown. Ignore it.
+      if (IsUnexpectedEndOfFile(ec) && file->may_have_uncommitted) {
+        continue;
+      }
+      return ec;
     }
 
-    const auto [rec, ec] = WriteEntryToFile(key, value, record.timestamp, is_tombstone, false,
+    read_lock.unlock();
+    // Close the file to avoid possible exhaustion of available file handles.
+    file->CloseFile();
+  }
+
+  // Sort remap.
+  std::sort(remap.begin(), remap.end(), [](const auto& a, const auto& b) {
+    return std::make_tuple(std::get<0>(a), std::get<1>(a), std::get<2>(a).offset) <
+           std::make_tuple(std::get<0>(b), std::get<1>(b), std::get<2>(b).offset);
+  });
+
+  FileInfo* current_file = {};
+  std::unique_ptr<std::shared_lock<std::shared_mutex>> read_lock;
+
+  for (const auto& [dst, _, record, ki] : remap) {
+    if (current_file != record.file) {
+      read_lock.reset();
+      // Close the file to avoid possible exhaustion of available file handles.
+      if (current_file) {
+        current_file->CloseFile();
+      }
+
+      // Set current file.
+      current_file = record.file;
+      // Acquiring read lock to prevent closing the file handle during the read.
+      read_lock = std::make_unique<std::shared_lock<std::shared_mutex>>(current_file->read_mutex);
+      // Ensure source file is opened.
+      if (auto ec = current_file->EnsureReadable()) {
+        return ec;
+      }
+    }
+
+    format::Entry e;
+    std::string key;
+    std::string value;
+
+    auto [read, ec] = ReadEntryImpl(current_file->fd, record.offset, false, e, key, value);
+    if (ec) {
+      return ec;
+    }
+
+    const auto [rec, ec2] = WriteEntryToFile(key, value, record.timestamp, e.is_tombstone(), false,
         // Target file provider.
         [&](const uint64_t length) -> FileInfoStatus {
-          size_t i = 0;
-          size_t index = slot;
+          // Ensure destination file is allocated.
+          if (output[dst].empty() || IsCapacityExceeded(output[dst].back()->size, length)) {
+            const auto index = (mode == CompactionMode::kGather) ? slot : get_scatter_slot(dst);
 
-          if (mode == CompactionMode::kScatter) {
-            i = XXH64(key.data(), key.size(), slot + 1) % 8;
-            index = get_scatter_slot(i);
-          }
-
-          if (output[i].empty() || IsCapacityExceeded(output[i].back()->size, length)) {
             auto [file, ec] = MakeWritableFile(
                 std::to_string(index) + "-" + std::to_string(++clock_) + ".tmp", options_.write_index);
             if (ec) {
@@ -758,21 +823,26 @@ std::error_code Database::PackFiles(
               return {{}, ec};
             }
 
-            output[i].push_back(std::move(file));
+            output[dst].push_back(std::move(file));
           }
-          return {output[i].back(), {}};
+
+          return {output[dst].back(), {}};
         });
 
-    if (ec) {
-      return ec;
+    if (ec2) {
+      return ec2;
     }
     // Store updated record.
     if (ki != keys_.end()) {
       updates.emplace_back(ki, rec);
     }
+  }
 
-    return {};
-  };
+  read_lock.reset();
+  // Close the file to avoid possible exhaustion of available file handles.
+  if (current_file) {
+    current_file->CloseFile();
+  }
 
   const auto rename_temporary = [](const auto& file) -> std::error_code {
     std::error_code ec;
@@ -789,30 +859,6 @@ std::error_code Database::PackFiles(
 
     return {};
   };
-
-  // 1. Process input files.
-  for (const auto& file : files) {
-    // Acquiring read lock to prevent closing the file handle during the read.
-    std::shared_lock read_lock(file->read_mutex);
-
-    // Ensure source file is opened.
-    if (auto ec = file->EnsureReadable()) {
-      return ec;
-    }
-    // Enumerate all records in the source file.
-    if (auto ec = EnumerateEntriesNoLock(file, cb)) {
-      // A former active file may have a partially written record at the end in case of unexpected shutdown.
-      // Ignore it.
-      if (IsUnexpectedEndOfFile(ec) && file->may_have_uncommitted) {
-        continue;
-      }
-      return ec;
-    }
-
-    read_lock.unlock();
-    // Close the file to avoid possible exhaustion of available file handles.
-    file->CloseFile();
-  }
 
   // 2. Finalize output files.
   for (size_t i = 0, end = output.size(); i != end; ++i) {
