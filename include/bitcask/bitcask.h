@@ -270,9 +270,6 @@ class Database {
   std::error_code PackFiles(
       const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int slot);
 
-  std::error_code PackFiles2(
-      const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int slot);
-
  private:
   std::optional<Record> GetKeyNoLock(const std::string_view key) const;
 
