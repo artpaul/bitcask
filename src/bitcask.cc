@@ -697,7 +697,7 @@ std::error_code Database::PackFiles2(
     const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int slot) {
   std::vector<std::vector<std::shared_ptr<FileInfo>>> output(8);
   // Mapping from source to target files.
-  std::vector<std::tuple<size_t, size_t, decltype(keys_)::iterator>> remap;
+  std::vector<std::tuple<unsigned, unsigned, Record, decltype(keys_)::iterator>> remap;
   std::vector<std::pair<decltype(keys_)::iterator, Record>> updates;
 
   [[maybe_unused]] Defer defer_cleanup([&] {
@@ -728,7 +728,7 @@ std::error_code Database::PackFiles2(
     }
 
     const auto remap_cb = [&](const Record& record, const bool is_tombstone, const std::string_view key,
-                              const std::string_view value) -> std::error_code {
+                              const std::string_view) -> std::error_code {
       auto ki = keys_.find(key);
       if (ki == keys_.end()) {
         if (is_tombstone) {
@@ -751,9 +751,9 @@ std::error_code Database::PackFiles2(
       }
 
       if (mode == CompactionMode::kScatter) {
-        remap.emplace_back(XXH64(key.data(), key.size(), slot + 1) % 8, i, ki);
+        remap.emplace_back(XXH64(key.data(), key.size(), slot + 1) % 8, i, record, ki);
       } else {
-        remap.emplace_back(0, i, ki);
+        remap.emplace_back(0, i, record, ki);
       }
       return {};
     };
@@ -775,16 +775,14 @@ std::error_code Database::PackFiles2(
 
   // Sort remap.
   std::sort(remap.begin(), remap.end(), [](const auto& a, const auto& b) {
-    return std::make_tuple(std::get<0>(a), std::get<1>(a), std::get<2>(a)->second.offset) <
-           std::make_tuple(std::get<0>(b), std::get<1>(b), std::get<2>(b)->second.offset);
+    return std::make_tuple(std::get<0>(a), std::get<1>(a), std::get<2>(a).offset) <
+           std::make_tuple(std::get<0>(b), std::get<1>(b), std::get<2>(b).offset);
   });
 
   FileInfo* current_file = {};
   std::unique_ptr<std::shared_lock<std::shared_mutex>> read_lock;
 
-  for (const auto& [dst, src, ki] : remap) {
-    const auto& record = ki->second;
-
+  for (const auto& [dst, _, record, ki] : remap) {
     if (current_file != record.file) {
       read_lock.reset();
       // Close the file to avoid possible exhaustion of available file handles.
@@ -802,13 +800,11 @@ std::error_code Database::PackFiles2(
       }
     }
 
-    const auto fd = current_file->fd;
+    format::Entry e;
     std::string key;
     std::string value;
 
-    format::Entry e;
-
-    auto [read, ec] = ReadEntryImpl(fd, record.offset, false, e, key, value);
+    auto [read, ec] = ReadEntryImpl(current_file->fd, record.offset, false, e, key, value);
     if (ec) {
       return ec;
     }
@@ -818,7 +814,7 @@ std::error_code Database::PackFiles2(
         [&](const uint64_t length) -> FileInfoStatus {
           // Ensure destination file is allocated.
           if (output[dst].empty() || IsCapacityExceeded(output[dst].back()->size, length)) {
-            size_t index = (mode == CompactionMode::kScatter) ? get_scatter_slot(dst) : slot;
+            const auto index = (mode == CompactionMode::kGather) ? slot : get_scatter_slot(dst);
 
             auto [file, ec] = MakeWritableFile(
                 std::to_string(index) + "-" + std::to_string(++clock_) + ".tmp", options_.write_index);
