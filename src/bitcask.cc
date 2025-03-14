@@ -616,23 +616,6 @@ std::error_code Database::Initialize() {
     return {};
   };
 
-  const auto enumerate_keys = [this](const auto& file, const auto& cb) {
-    FileSections sections;
-
-    if (auto ec = LoadFileSections(file, &sections)) {
-      return ec;
-    }
-
-    if (sections.index) {
-      return EnumerateIndex(file, sections.index.value(), cb);
-    } else {
-      return EnumerateEntries(file, sections.entries.value(),
-          [&](const Record& record, const bool is_tombstone, std::string_view key, std::string_view) {
-            return cb(record, is_tombstone, key);
-          });
-    }
-  };
-
   for (const auto& entry : std::filesystem::directory_iterator(base_path_)) {
     if (!entry.is_regular_file()) {
       continue;
@@ -656,7 +639,7 @@ std::error_code Database::Initialize() {
     }
     [[maybe_unused]] Defer do_close([file]() { file->CloseFile(); });
     // Read keys from the file.
-    if (auto ec = enumerate_keys(file, cb)) {
+    if (auto ec = EnumerateKeys(file, cb)) {
       if (IsNotFound(ec)) {
         continue;
       }
@@ -727,8 +710,8 @@ std::error_code Database::PackFiles(
       return ec;
     }
 
-    const auto remap_cb = [&](const Record& record, const bool is_tombstone, const std::string_view key,
-                              const std::string_view) -> std::error_code {
+    const auto remap_cb = [&](const Record& record, const bool is_tombstone,
+                              const std::string_view key) -> std::error_code {
       auto ki = keys_.find(key);
       if (ki == keys_.end()) {
         if (is_tombstone) {
@@ -759,7 +742,7 @@ std::error_code Database::PackFiles(
     };
 
     // Enumerate all records in the source file.
-    if (auto ec = EnumerateEntriesNoLock(file, remap_cb)) {
+    if (auto ec = EnumerateKeys(file, remap_cb)) {
       // A former active file may have a partially written record at the end in case of unexpected
       // shutdown. Ignore it.
       if (IsUnexpectedEndOfFile(ec) && file->may_have_uncommitted) {
@@ -957,48 +940,97 @@ void Database::WaitKeyUnlocked(
   lock.lock();
 }
 
+std::error_code Database::EnumerateKeys(const std::shared_ptr<FileInfo>& file,
+    const std::function<std::error_code(const Record&, const bool, std::string_view)>& cb) const {
+  FileSections sections;
+
+  if (auto ec = LoadFileSections(file, &sections)) {
+    return ec;
+  }
+
+  if (sections.index) {
+    return EnumerateIndex(file, sections.index.value(), cb);
+  } else {
+    return EnumerateEntries(file, sections.entries.value(),
+        [&](const Record& record, const bool is_tombstone, std::string_view key, std::string_view) {
+          return cb(record, is_tombstone, key);
+        });
+  }
+}
+
 std::error_code Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file,
     const FileSections::Range& range,
     const std::function<std::error_code(const Record&, const bool, std::string_view)>& cb) const {
-  const auto fd = file->fd;
-  std::string key;
+  // Temporary buffer.
+  std::vector<std::byte> buf((64ul << 10) + 4096u);
+  // Current offset in the temporary buffer.
+  std::byte* buf_ptr = buf.data();
+  // Size of the data in the buffer.
+  size_t buf_size = 0;
+  uint64_t crc;
+  format::Index index;
 
   for (size_t offset = range.first, end = range.second; offset < end;) {
-    uint64_t crc;
-    format::Index index;
-    // Load crc.
-    if (auto ec = LoadFromFile(fd, &crc, sizeof(crc), offset)) {
+    const auto size = std::min<size_t>((buf.size() - (buf_ptr - buf.data())), end - offset);
+    // Load data from file.
+    if (auto ec = LoadFromFile(file->fd, buf_ptr, size, offset)) {
       return ec;
     }
-    // Load entry.
-    if (auto ec = LoadFromFile(fd, &index, sizeof(index), offset)) {
-      return ec;
-    }
-    key.resize(index.key_size);
-    // Load key.
-    if (auto ec = LoadFromFile(fd, key.data(), key.size(), offset)) {
-      return ec;
-    }
-    // Check crc.
-    const std::array parts{
-        iovec{.iov_base = &index, .iov_len = sizeof(index)},
-        iovec{.iov_base = key.data(), .iov_len = key.size()},
-    };
-    if (Hash64(std::span(parts)) != crc) {
-      return MakeErrorCode(BitcaskError::kInconsistent);
-    }
+    // Adjust size of the data in the buffer.
+    buf_size = (buf_ptr - buf.data()) + size;
+    // Reset buffer pointer.
+    buf_ptr = buf.data();
 
-    const Record record{
-        .file = file.get(),
-        .timestamp = index.timestamp,
-        .offset = uint32_t(index.entry_pos),
-        .size = index.value_size,
-    };
+    while (buf_ptr < buf.data() + buf_size) {
+      // Check whether the header within the buffer.
+      if (auto left = buf_size - (buf_ptr - buf.data()); left < sizeof(crc) + sizeof(index)) {
+        std::memmove(buf.data(), buf_ptr, left);
 
-    if (auto ec = cb(record, index.flags & format::kEntryFlagTombstone, key)) {
-      return ec;
+        buf_ptr = buf.data() + left;
+        // Load more data.
+        break;
+      }
+
+      // Load crc.
+      std::memcpy(&crc, buf_ptr, sizeof(crc));
+      // Load entry.
+      std::memcpy(&index, buf_ptr + sizeof(crc), sizeof(index));
+      // Advance the pointer.
+      buf_ptr += sizeof(crc) + sizeof(index);
+      // Check crc.
+      const std::array parts{
+          iovec{.iov_base = &index, .iov_len = sizeof(index)},
+          iovec{.iov_base = buf_ptr, .iov_len = index.key_size},
+      };
+      if (Hash64(std::span(parts)) != crc) {
+        return MakeErrorCode(BitcaskError::kInconsistent);
+      }
+      // Check whether the key within the buffer.
+      if (buf_ptr + index.key_size > buf.data() + buf_size) {
+        return MakeErrorCode(BitcaskError::kUnexpectedEndOfFile);
+      }
+
+      // Setup the key.
+      const std::string_view key((const char*)buf_ptr, index.key_size);
+      // Setup the record.
+      const Record record{
+          .file = file.get(),
+          .timestamp = index.timestamp,
+          .offset = uint32_t(index.entry_pos),
+          .size = index.value_size,
+      };
+
+      if (auto ec = cb(record, index.flags & format::kEntryFlagTombstone, key)) {
+        return ec;
+      }
+
+      // Advance the pointer.
+      buf_ptr += key.size();
     }
   }
+
+  // Check the buffer is fully read.
+  assert(buf_ptr == buf.data() + buf_size);
 
   return {};
 }
