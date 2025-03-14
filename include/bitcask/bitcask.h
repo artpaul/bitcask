@@ -283,6 +283,14 @@ class Database {
   void WaitKeyUnlocked(const std::string_view key, std::shared_lock<std::shared_mutex>& lock) const;
 
  private:
+  /**
+   * Enumerates all keys in a file.
+   *
+   * @param file a file to enumerate.
+   */
+  std::error_code EnumerateKeys(const std::shared_ptr<FileInfo>& file,
+      const std::function<std::error_code(const Record&, const bool, std::string_view)>& cb) const;
+
   std::error_code EnumerateIndex(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
       const std::function<std::error_code(const Record&, const bool, std::string_view)>& cb) const;
 
