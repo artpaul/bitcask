@@ -965,6 +965,8 @@ std::error_code Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file,
   std::vector<std::byte> buf((64ul << 10) + 4096u);
   // Current offset in the temporary buffer.
   std::byte* buf_ptr = buf.data();
+  // Size of the data in the buffer.
+  size_t buf_size = 0;
   uint64_t crc;
   format::Index index;
 
@@ -974,12 +976,14 @@ std::error_code Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file,
     if (auto ec = LoadFromFile(file->fd, buf_ptr, size, offset)) {
       return ec;
     }
+    // Adjust size of the data in the buffer.
+    buf_size = (buf_ptr - buf.data()) + size;
     // Reset buffer pointer.
     buf_ptr = buf.data();
 
-    while (true) {
+    while (buf_ptr < buf.data() + buf_size) {
       // Check whether the header within the buffer.
-      if (auto left = buf_ptr - buf.data(); left < sizeof(crc) + sizeof(index)) {
+      if (auto left = buf_size - (buf_ptr - buf.data()); left < sizeof(crc) + sizeof(index)) {
         std::memmove(buf.data(), buf_ptr, left);
 
         buf_ptr = buf.data() + left;
@@ -1001,6 +1005,10 @@ std::error_code Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file,
       if (Hash64(std::span(parts)) != crc) {
         return MakeErrorCode(BitcaskError::kInconsistent);
       }
+      // Check whether the key within the buffer.
+      if (buf_ptr + index.key_size > buf.data() + buf_size) {
+        return MakeErrorCode(BitcaskError::kUnexpectedEndOfFile);
+      }
 
       // Setup the key.
       const std::string_view key((const char*)buf_ptr, index.key_size);
@@ -1020,6 +1028,9 @@ std::error_code Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file,
       buf_ptr += key.size();
     }
   }
+
+  // Check the buffer is fully read.
+  assert(buf_ptr == buf.data() + buf_size);
 
   return {};
 }
