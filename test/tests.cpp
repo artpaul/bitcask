@@ -244,6 +244,24 @@ TEST_CASE("Write / Read / Delete") {
   REQUIRE(db->Get({}, "abc", nullptr));
 }
 
+TEST_CASE("Delete no flush") {
+  TemporaryDirectory temp_dir;
+  std::unique_ptr<bitcask::Database> db;
+
+  auto options = kDefaultOptions;
+  options.flush_mode = bitcask::FlushMode::kImmediately;
+  options.flush_mode_for_delete = bitcask::FlushMode::kOnClose;
+
+  REQUIRE_FALSE(bitcask::Database::Open(options, temp_dir.GetPath(), db));
+
+  REQUIRE_FALSE(db->Put({}, "abc", "test"));
+  std::string value;
+  REQUIRE_FALSE(db->Get({}, "abc", &value));
+  CHECK(value == "test");
+  REQUIRE_FALSE(db->Delete({}, "abc"));
+  REQUIRE(db->Get({}, "abc", nullptr));
+}
+
 TEST_CASE("Write multiple active files") {
   TemporaryDirectory temp_dir;
   std::unique_ptr<bitcask::Database> db;
