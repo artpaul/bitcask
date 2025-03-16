@@ -160,6 +160,17 @@ bool Database::ActiveFile::MaybeFlushImmediately(const std::chrono::nanoseconds 
   return result;
 }
 
+std::error_code Database::FileInfo::Allocate([[maybe_unused]] const uint64_t size) noexcept {
+#if defined(__linux__)
+  const int ret = ::fallocate(this->fd, FALLOC_FL_KEEP_SIZE, 0, size);
+  // Check error response.
+  if (ret == -1) {
+    return std::make_error_code(static_cast<std::errc>(errno));
+  }
+#endif
+  return {};
+}
+
 std::error_code Database::FileInfo::Append(const std::span<const iovec>& parts, const bool sync) noexcept {
   const size_t length = std::accumulate(
       parts.begin(), parts.end(), 0ul, [](const auto acc, const auto& p) { return acc + p.iov_len; });
@@ -180,6 +191,21 @@ std::error_code Database::FileInfo::Append(const std::span<const iovec>& parts, 
   size += length;
 
   return {};
+}
+
+std::error_code Database::FileInfo::Truncate() noexcept {
+  // The file is not opened.
+  if (fd == -1) {
+    return {};
+  }
+
+  const int ret = ::ftruncate(this->fd, this->size);
+  // Check errors.
+  if (ret == -1) {
+    return std::make_error_code(static_cast<std::errc>(errno));
+  } else {
+    return {};
+  }
 }
 
 bool Database::FileInfo::CloseFile(bool sync) {
@@ -246,6 +272,11 @@ Database::~Database() {
   // Close writable files.
   for (const auto& item : active_files_) {
     if (item.file) {
+      // Trim extra space if preallocation is enabled.
+      if (options_.preallocate) {
+        item.file->Truncate();
+      }
+
       item.file->CloseFile(options_.flush_mode != FlushMode::kNone);
     }
   }
@@ -557,6 +588,11 @@ std::error_code Database::Rotate() {
 
   // Close files for writing.
   for (const auto& f : files) {
+    // Trim extra space if preallocation is enabled.
+    if (options_.preallocate) {
+      f->Truncate();
+    }
+
     f->CloseFile(options_.flush_mode != FlushMode::kNone);
   }
   // Acquire exclusive access to the list of data files.
@@ -678,6 +714,7 @@ bool Database::IsLastCompactionLevel(const size_t i) const noexcept {
 
 std::error_code Database::PackFiles(
     const std::vector<std::shared_ptr<FileInfo>>& files, const CompactionMode mode, const int slot) {
+  std::vector<uint64_t> sizes(8);
   std::vector<std::vector<std::shared_ptr<FileInfo>>> output(8);
   // Mapping from source to target files.
   std::vector<std::tuple<unsigned, unsigned, Record, decltype(keys_)::iterator>> remap;
@@ -762,6 +799,12 @@ std::error_code Database::PackFiles(
     return std::make_tuple(std::get<0>(a), std::get<1>(a), std::get<2>(a).offset) <
            std::make_tuple(std::get<0>(b), std::get<1>(b), std::get<2>(b).offset);
   });
+  // Calculate approximate size of output files.
+  if (options_.preallocate) {
+    for (size_t i = 0, end = remap.size(); i != end; ++i) {
+      sizes[std::get<0>(remap[i])] += std::get<2>(remap[i]).size + 128;
+    }
+  }
 
   // File guard.
   std::unique_ptr<FileInfo, std::function<void(FileInfo*)>> current_file(
@@ -795,6 +838,13 @@ std::error_code Database::PackFiles(
             if (ec) {
               assert(!bool(file));
               return {{}, ec};
+            }
+            // Preallocate disk space.
+            if (options_.preallocate) {
+              const auto size = sizes[dst] > options_.max_file_size ? options_.max_file_size : sizes[dst];
+
+              file->Allocate(size);
+              sizes[dst] -= size;
             }
 
             output[dst].push_back(std::move(file));
@@ -1070,8 +1120,6 @@ std::error_code Database::EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>
 }
 
 bool Database::IsCapacityExceeded(const uint64_t current_size, const uint64_t length) const noexcept {
-  static constinit auto kMaxEntryOffset = std::numeric_limits<decltype(Record::offset)>::max();
-
   return
       // Ensure that the offset of the value does not overflow.
       (current_size) > kMaxEntryOffset ||
@@ -1187,6 +1235,10 @@ std::pair<Database::Record, std::error_code> Database::WriteEntry(const std::str
         assert(!bool(file));
         return {{}, ec};
       } else {
+        if (options_.preallocate) {
+          file->Allocate(options_.max_file_size);
+        }
+
         active_file.file = std::move(file);
       }
     }
