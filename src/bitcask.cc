@@ -689,6 +689,7 @@ std::error_code Database::PackFiles(
         if (!bool(f)) {
           continue;
         }
+        f->CloseFile();
         // Adjust the counter of space used.
         space_used_.fetch_sub(f->size, std::memory_order_relaxed);
         // Remove temporary file.
@@ -762,19 +763,18 @@ std::error_code Database::PackFiles(
            std::make_tuple(std::get<0>(b), std::get<1>(b), std::get<2>(b).offset);
   });
 
-  FileInfo* current_file = {};
+  // File guard.
+  std::unique_ptr<FileInfo, std::function<void(FileInfo*)>> current_file(
+      nullptr, [](FileInfo* f) { f->CloseFile(); });
+  // File lock.
   std::unique_ptr<std::shared_lock<std::shared_mutex>> read_lock;
 
   for (const auto& [dst, _, record, ki] : remap) {
-    if (current_file != record.file) {
+    if (current_file.get() != record.file) {
       read_lock.reset();
-      // Close the file to avoid possible exhaustion of available file handles.
-      if (current_file) {
-        current_file->CloseFile();
-      }
 
       // Set current file.
-      current_file = record.file;
+      current_file.reset(record.file);
       // Acquiring read lock to prevent closing the file handle during the read.
       read_lock = std::make_unique<std::shared_lock<std::shared_mutex>>(current_file->read_mutex);
       // Ensure source file is opened.
@@ -783,16 +783,7 @@ std::error_code Database::PackFiles(
       }
     }
 
-    format::Entry e;
-    std::string key;
-    std::string value;
-
-    auto [read, ec] = ReadEntryImpl(current_file->fd, record.offset, false, e, key, value);
-    if (ec) {
-      return ec;
-    }
-
-    const auto [rec, ec2] = WriteEntryToFile(key, value, record.timestamp, e.is_tombstone(), false,
+    const auto [rec, ec] = CopyEntry(current_file->fd, record.offset,
         // Target file provider.
         [&](const uint64_t length) -> FileInfoStatus {
           // Ensure destination file is allocated.
@@ -812,8 +803,8 @@ std::error_code Database::PackFiles(
           return {output[dst].back(), {}};
         });
 
-    if (ec2) {
-      return ec2;
+    if (ec) {
+      return ec;
     }
     // Store updated record.
     if (ki != keys_.end()) {
@@ -823,9 +814,7 @@ std::error_code Database::PackFiles(
 
   read_lock.reset();
   // Close the file to avoid possible exhaustion of available file handles.
-  if (current_file) {
-    current_file->CloseFile();
-  }
+  current_file.reset();
 
   const auto rename_temporary = [](const auto& file) -> std::error_code {
     std::error_code ec;
@@ -1296,6 +1285,73 @@ std::optional<int> Database::ParseLayoutIndex(std::string_view name) {
     return num;
   }
   return {};
+}
+
+std::pair<Database::Record, std::error_code> Database::CopyEntry(
+    const int fd, const size_t offset2, const std::function<FileInfoStatus(uint64_t)>& cb) {
+  size_t current_offset = offset2 + sizeof(uint64_t);
+  format::Entry entry;
+
+  // Load entry.
+  if (auto ec = LoadFromFile(fd, &entry, sizeof(entry), current_offset)) {
+    return {{}, ec};
+  }
+
+  // Total size of data to write.
+  const uint64_t length = sizeof(uint64_t) + sizeof(format::Entry) + entry.value_size + entry.key_size;
+  // Get file to write to.
+  const auto [file, ec] = cb(length);
+  if (ec) {
+    return {{}, ec};
+  }
+  // Offset at which a new entry will be written.
+  const uint64_t record_offset = file->size;
+  // Write data to the file.
+  std::vector<std::byte> buf(64ull << 10);
+  off_t off = offset2;
+
+  for (uint64_t len = length; len > 0;) {
+    const ssize_t read = ::pread(fd, buf.data(), std::min<size_t>(buf.size(), len), off);
+    // Check errors.
+    if (read == -1) {
+      return {{}, std::make_error_code(static_cast<std::errc>(errno))};
+    } else if (read == 0) {
+      return {{}, MakeErrorCode(BitcaskError::kUnexpectedEndOfFile)};
+    }
+
+    const ssize_t written = ::write(file->fd, buf.data(), read);
+    // Write errors.
+    if (written == -1) {
+      return {{}, std::make_error_code(static_cast<std::errc>(errno))};
+    }
+    if (written != read) {
+      return {{}, std::make_error_code(std::errc::io_error)};
+    }
+    // Update total size of the file.
+    file->size += written;
+
+    // Update read position.
+    len -= read;
+    off += read;
+  }
+
+  // Count used space.
+  space_used_.fetch_add(length, std::memory_order_relaxed);
+  // Count entries.
+  if (entry.is_tombstone()) {
+    file->tombstones.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    file->records.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  const Record record{
+      .file = file.get(),
+      .timestamp = entry.timestamp,
+      .offset = uint32_t(record_offset),
+      .size = uint32_t(entry.value_size),
+  };
+
+  return {record, {}};
 }
 
 std::pair<Database::Record, std::error_code> Database::WriteEntryToFile(const std::string_view key,
