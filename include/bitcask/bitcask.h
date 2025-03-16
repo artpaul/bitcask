@@ -332,6 +332,18 @@ class Database {
   std::error_code ReadValue(const ReadOptions& options, const Record& record, std::string& value) const;
 
   /**
+   * Copies a record from source file to a data file provided by \p cb
+   *
+   * @param fd source file.
+   * @param offset offset of the record to copy.
+   * @param cb file provider.
+   *
+   * @returns Descriptor of the written record or an error code if the write was unsuccessful.
+   */
+  std::pair<Record, std::error_code> CopyEntry(
+      const int fd, const size_t offset, const std::function<FileInfoStatus(uint64_t)>& cb);
+
+  /**
    * Writes a record to the active data file.
    *
    * @returns Descriptor of the written record or an error code if the write was unsuccessful.
