@@ -221,8 +221,6 @@ class Database {
   static_assert(std::is_trivial_v<Record>);
   static_assert(sizeof(Record) == sizeof(void*) + 16);
 
-  static constexpr uint64_t kMaxEntryOffset = std::numeric_limits<decltype(Record::offset)>::max();
-
   using FileInfoStatus = std::pair<std::shared_ptr<FileInfo>, std::error_code>;
 
  public:

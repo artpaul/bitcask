@@ -1120,6 +1120,8 @@ std::error_code Database::EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>
 }
 
 bool Database::IsCapacityExceeded(const uint64_t current_size, const uint64_t length) const noexcept {
+  static constexpr uint64_t kMaxEntryOffset = std::numeric_limits<decltype(Record::offset)>::max();
+
   return
       // Ensure that the offset of the value does not overflow.
       (current_size) > kMaxEntryOffset ||
