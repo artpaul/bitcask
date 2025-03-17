@@ -1387,6 +1387,11 @@ std::pair<Database::Record, std::error_code> Database::CopyEntry(
     // Update read position.
     len -= read;
     off += read;
+
+    // Throttle.
+    if (options_.throttle_compaction && len > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
 
   // Count used space.

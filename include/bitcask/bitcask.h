@@ -52,6 +52,9 @@ struct Options {
   /// If true, the store will be opened in read-only mode.
   bool read_only = false;
 
+  /// Limit speed of compaction process.
+  bool throttle_compaction = false;
+
   /// Write index at the end of each merged file.
   bool write_index = true;
 };
