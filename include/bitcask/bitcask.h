@@ -46,6 +46,9 @@ struct Options {
   /// If the database has been loaded successfully, clean up any temporary files at startup.
   bool clean_temporary_on_startup = true;
 
+  /// Preallocate output files.
+  bool preallocate = false;
+
   /// If true, the store will be opened in read-only mode.
   bool read_only = false;
 
@@ -152,6 +155,13 @@ class Database {
 #endif
 
     /**
+     * Allocate disk space for the output file.
+     *
+     * @param size number of bytes to allocate.
+     */
+    std::error_code Allocate(const uint64_t size) noexcept;
+
+    /**
      * Appends data to the file.
      *
      * @param parts scatter parts of the data to write.
@@ -172,6 +182,11 @@ class Database {
      * Checks file is opened otherwise opens it in read-only mode.
      */
     std::error_code EnsureReadable();
+
+    /**
+     * @brief Truncates the file to the actual size if the file is opened.
+     */
+    std::error_code Truncate() noexcept;
   };
 
   struct WaitQueue {
