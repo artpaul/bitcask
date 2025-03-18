@@ -323,7 +323,7 @@ std::error_code Database::Delete(const WriteOptions& options, const std::string_
                               ? FlushMode::kImmediately
                               : options_.flush_mode;
   // Write the tombstone.
-  auto [_, ec] = WriteEntry(key, {}, timestamp.value(), true, flush_mode);
+  auto [_, ec] = WriteEntry(key, {}, timestamp.value(), true, flush_mode, GetActiveFileNoLock(key));
   if (ec) {
     return ec;
   }
@@ -412,7 +412,7 @@ std::error_code Database::Put(
                               ? FlushMode::kImmediately
                               : options_.flush_mode;
   // Write the value with the specific timestamp.
-  auto [record, ec] = WriteEntry(key, value, timestamp, false, flush_mode);
+  auto [record, ec] = WriteEntry(key, value, timestamp, false, flush_mode, GetActiveFileNoLock(key));
   if (ec) {
     return ec;
   }
@@ -520,7 +520,11 @@ std::error_code Database::Pack(bool force) {
       updated_keys_ = std::make_unique<unordered_string_map<Record>>();
     }
 
-    auto ec = PackFiles(files, mode, i);
+    auto ec = [&] {
+      [[maybe_unused]] Defer do_return([this] { compaction_is_active_.store(false); });
+      compaction_is_active_.store(true);
+      return PackFiles(files, mode, i);
+    }();
 
     {
       std::unique_lock op_lock(operation_mutex_);
@@ -1203,11 +1207,8 @@ std::error_code Database::ReadValue(
 }
 
 std::pair<Database::Record, std::error_code> Database::WriteEntry(const std::string_view key,
-    const std::string_view value, const uint64_t timestamp, const bool is_tombstone, FlushMode flush_mode) {
-  ActiveFile& active_file = active_files_.size() == 1
-                                ? active_files_[0]
-                                : active_files_[XXH64(key.data(), key.size(), 0) % active_files_.size()];
-
+    const std::string_view value, const uint64_t timestamp, const bool is_tombstone, FlushMode flush_mode,
+    ActiveFile& active_file) {
   std::unique_lock write_lock(active_file.write_mutex, std::defer_lock);
   // Target file provider.
   const auto file_provider = [&](const uint64_t length) -> FileInfoStatus {
@@ -1339,6 +1340,18 @@ std::optional<int> Database::ParseLayoutIndex(std::string_view name) {
     return num;
   }
   return {};
+}
+
+Database::ActiveFile& Database::GetActiveFileNoLock(const std::string_view key) noexcept {
+  assert(active_files_.size());
+  // Only one active file in place. Nothing to select.
+  if (active_files_.size() == 1) {
+    return active_files_[0];
+  }
+
+  const auto size = active_files_.size() - (compaction_is_active_.load(std::memory_order_relaxed) ? 1 : 0);
+  // Spread load between multiple active files.
+  return active_files_[XXH64(key.data(), key.size(), 0) % size];
 }
 
 std::pair<Database::Record, std::error_code> Database::CopyEntry(

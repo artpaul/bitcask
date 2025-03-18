@@ -34,7 +34,7 @@ struct Options {
   /// Number of active files.
   uint8_t active_files = 1;
 
-  /// Mode of flushing in-core data to storage device.
+  /// Mode of flushing written in-core data to storage device.
   FlushMode flush_mode = FlushMode::kNone;
 
   std::chrono::nanoseconds flush_delay = std::chrono::milliseconds(1);
@@ -361,13 +361,16 @@ class Database {
   std::pair<Record, std::error_code> CopyEntry(
       const int fd, const size_t offset, const std::function<FileInfoStatus(uint64_t)>& cb);
 
+  ActiveFile& GetActiveFileNoLock(const std::string_view key) noexcept;
+
   /**
    * Writes a record to the active data file.
    *
    * @returns Descriptor of the written record or an error code if the write was unsuccessful.
    */
   std::pair<Record, std::error_code> WriteEntry(const std::string_view key, const std::string_view value,
-      const uint64_t timestamp, const bool is_tombstone, const FlushMode flush_mode);
+      const uint64_t timestamp, const bool is_tombstone, const FlushMode flush_mode,
+      ActiveFile& active_file);
 
   /**
    * Writes a record to a data file provided by \p cb
@@ -433,6 +436,8 @@ class Database {
   size_t compaction_slots_count_{1};
   /// Ranges of compaction levels.
   std::vector<std::pair<size_t, size_t>> compaction_levels_;
+  /// Indication of active compaction process.
+  std::atomic_bool compaction_is_active_{false};
 
   mutable std::mutex file_mutex_;
   /// Ln read-only data files.
