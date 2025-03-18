@@ -253,7 +253,16 @@ std::error_code Database::FileInfo::EnsureReadable() {
 }
 
 Database::Database(const Options& options, const std::filesystem::path& path)
-    : options_(options), base_path_(path), active_files_(std::max<unsigned>(1u, options.active_files)) {
+    : options_(options)
+    , base_path_(path)
+    // Ensure there will be at least one active file.
+    , active_files_(std::max<unsigned>(1u, options.active_files))
+    // Special file for writing deletes.
+    , active_file_for_deletes_(
+          options_.flush_mode_for_delete ? std::make_optional<ActiveFile>() : std::optional<ActiveFile>()) {
+  // Adjust number of active files.
+  options_.active_files = active_files_.size();
+
   // Calculate number of slots for an LSM-tree with up to 8 nodes per level, starting with the second.
   compaction_slots_count_ = ((1ull << (3 * (options_.compaction_levels + 1))) - 1) / 7;
 
@@ -278,6 +287,12 @@ Database::~Database() {
       }
 
       item.file->CloseFile(options_.flush_mode != FlushMode::kNone);
+    }
+  }
+  if (const auto& item = active_file_for_deletes_) {
+    if (item->file) {
+      item->file->CloseFile(
+          options_.flush_mode_for_delete.value_or(options_.flush_mode) != FlushMode::kNone);
     }
   }
   // Close read-only files.
@@ -318,12 +333,12 @@ std::error_code Database::Delete(const WriteOptions& options, const std::string_
   }
 
   [[maybe_unused]] Defer d([this, key] { UnlockKey(key); });
-  //
-  const auto flush_mode = (options.sync && (options_.flush_mode != FlushMode::kDelay))
-                              ? FlushMode::kImmediately
-                              : options_.flush_mode;
+  // Initial flushing mode for delete.
+  auto flush_mode = options_.flush_mode_for_delete.value_or(options_.flush_mode);
+  // Adjust flushing mode.
+  flush_mode = (options.sync && (flush_mode != FlushMode::kDelay)) ? FlushMode::kImmediately : flush_mode;
   // Write the tombstone.
-  auto [_, ec] = WriteEntry(key, {}, timestamp.value(), true, flush_mode, GetActiveFileNoLock(key));
+  auto [_, ec] = WriteEntry(key, {}, timestamp.value(), true, flush_mode, GetActiveFileNoLock(key, true));
   if (ec) {
     return ec;
   }
@@ -412,7 +427,7 @@ std::error_code Database::Put(
                               ? FlushMode::kImmediately
                               : options_.flush_mode;
   // Write the value with the specific timestamp.
-  auto [record, ec] = WriteEntry(key, value, timestamp, false, flush_mode, GetActiveFileNoLock(key));
+  auto [record, ec] = WriteEntry(key, value, timestamp, false, flush_mode, GetActiveFileNoLock(key, false));
   if (ec) {
     return ec;
   }
@@ -577,7 +592,7 @@ std::error_code Database::Rotate() {
     return MakeErrorCode(BitcaskError::kReadOnly);
   }
 
-  for (auto& item : active_files_) {
+  const auto rotate_active_file = [&](auto& item) {
     // Acquire exclusive access for writing to active file.
     std::lock_guard write_lock(item.write_mutex);
     //
@@ -588,6 +603,13 @@ std::error_code Database::Rotate() {
     if (item.file) {
       files.push_back(std::move(item.file));
     }
+  };
+
+  for (auto& item : active_files_) {
+    rotate_active_file(item);
+  }
+  if (active_file_for_deletes_) {
+    rotate_active_file(active_file_for_deletes_.value());
   }
 
   // Close files for writing.
@@ -1123,6 +1145,16 @@ std::error_code Database::EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>
   return EnumerateEntries(file, sections.entries.value(), cb);
 }
 
+Database::ActiveFile& Database::GetActiveFileNoLock(const std::string_view key, bool is_delete) noexcept {
+  if (is_delete && bool(active_file_for_deletes_)) {
+    return active_file_for_deletes_.value();
+  } else {
+    return active_files_.size() == 1
+               ? active_files_[0]
+               : active_files_[XXH64(key.data(), key.size(), 0) % active_files_.size()];
+  }
+}
+
 bool Database::IsCapacityExceeded(const uint64_t current_size, const uint64_t length) const noexcept {
   static constexpr uint64_t kMaxEntryOffset = std::numeric_limits<decltype(Record::offset)>::max();
 
@@ -1239,7 +1271,11 @@ std::pair<Database::Record, std::error_code> Database::WriteEntry(const std::str
         return {{}, ec};
       } else {
         if (options_.preallocate) {
-          file->Allocate(options_.max_file_size);
+          const auto size = (options_.flush_mode_for_delete && is_tombstone)
+                                ? std::min<uint64_t>(64ull << 20, options_.max_file_size)
+                                : options_.max_file_size;
+
+          file->Allocate(size);
         }
 
         active_file.file = std::move(file);

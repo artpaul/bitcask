@@ -37,6 +37,8 @@ struct Options {
   /// Mode of flushing written in-core data to storage device.
   FlushMode flush_mode = FlushMode::kNone;
 
+  std::optional<FlushMode> flush_mode_for_delete = {};
+
   std::chrono::nanoseconds flush_delay = std::chrono::milliseconds(1);
 
   uint32_t max_file_size = std::numeric_limits<uint32_t>::max();
@@ -325,6 +327,8 @@ class Database {
       const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>&
           cb) const;
 
+  ActiveFile& GetActiveFileNoLock(const std::string_view key, bool is_delete) noexcept;
+
   /**
    * Checks whether the appending block would exceed the file's capacity.
    *
@@ -431,6 +435,8 @@ class Database {
 
   /// A list of active files that can be opened simultaneously.
   std::vector<ActiveFile> active_files_;
+  /// Dedicated file for deletes.
+  std::optional<ActiveFile> active_file_for_deletes_;
 
   /// The maximum number of LSMT slots available.
   size_t compaction_slots_count_{1};
