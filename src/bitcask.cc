@@ -71,25 +71,41 @@ std::error_code LoadFromFile(int fd, void* buf, size_t len, size_t& off) noexcep
  * @returns bytes read or an error code.
  */
 std::pair<size_t, std::error_code> ReadEntryImpl(const int fd, const size_t offset, const bool check_crc,
-    format::Entry& entry, std::string& key, std::string& value) {
+    format::Entry& entry, std::string& key, std::string* value) {
   size_t current_offset = offset;
-  uint64_t crc;
-  // Load crc.
-  if (auto ec = LoadFromFile(fd, &crc, sizeof(crc), current_offset)) {
-    return {{}, ec};
+  std::string buf;
+  std::string* actual_value = bool(value) ? value : (check_crc ? &buf : nullptr);
+  uint64_t crc = 0;
+
+  // Crc.
+  if (check_crc) {
+    // Load crc.
+    if (auto ec = LoadFromFile(fd, &crc, sizeof(crc), current_offset)) {
+      return {{}, ec};
+    }
+  } else {
+    current_offset += sizeof(crc);
   }
+
   // Load entry.
   if (auto ec = LoadFromFile(fd, &entry, sizeof(entry), current_offset)) {
     return {{}, ec};
   }
-  // Validate entry.
-  // TODO: max_value_size
-  key.resize(entry.key_size);
-  value.resize(entry.value_size);
-  // Load value.
-  if (auto ec = LoadFromFile(fd, value.data(), value.size(), current_offset)) {
-    return {{}, ec};
+
+  // Value.
+  if (actual_value) {
+    // TODO: max_value_size
+    actual_value->resize(entry.value_size);
+    // Load value.
+    if (auto ec = LoadFromFile(fd, actual_value->data(), actual_value->size(), current_offset)) {
+      return {{}, ec};
+    }
+  } else {
+    current_offset += entry.value_size;
   }
+
+  // Key.
+  key.resize(entry.key_size);
   // Load key.
   if (auto ec = LoadFromFile(fd, key.data(), key.size(), current_offset)) {
     return {{}, ec};
@@ -97,9 +113,11 @@ std::pair<size_t, std::error_code> ReadEntryImpl(const int fd, const size_t offs
 
   // Check crc.
   if (check_crc) {
+    assert(actual_value);
+
     const std::array parts{
         iovec{.iov_base = &entry, .iov_len = sizeof(entry)},
-        iovec{.iov_base = value.data(), .iov_len = value.size()},
+        iovec{.iov_base = actual_value->data(), .iov_len = actual_value->size()},
         iovec{.iov_base = key.data(), .iov_len = key.size()},
     };
 
@@ -1016,7 +1034,7 @@ std::error_code Database::EnumerateKeys(const std::shared_ptr<FileInfo>& file,
   if (sections.index) {
     return EnumerateIndex(file, sections.index.value(), cb);
   } else {
-    return EnumerateEntries(file, sections.entries.value(),
+    return EnumerateEntries(file, sections.entries.value(), false,
         [&](const Record& record, const bool is_tombstone, std::string_view key, std::string_view) {
           return cb(record, is_tombstone, key);
         });
@@ -1101,7 +1119,7 @@ std::error_code Database::EnumerateIndex(const std::shared_ptr<FileInfo>& file,
 }
 
 std::error_code Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file,
-    const FileSections::Range& range,
+    const FileSections::Range& range, const bool read_values,
     const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>& cb)
     const {
   const auto fd = file->fd;
@@ -1111,7 +1129,7 @@ std::error_code Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file
   for (size_t offset = range.first, end = range.second; offset < end;) {
     format::Entry e;
 
-    auto [read, ec] = ReadEntryImpl(fd, offset, false, e, key, value);
+    auto [read, ec] = ReadEntryImpl(fd, offset, false, e, key, read_values ? &value : nullptr);
     if (ec) {
       return ec;
     }
@@ -1120,7 +1138,7 @@ std::error_code Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file
         .file = file.get(),
         .timestamp = e.timestamp,
         .offset = uint32_t(offset),
-        .size = uint32_t(value.size()),
+        .size = e.value_size,
     };
 
     if (auto s = cb(record, (e.flags & format::kEntryFlagTombstone), key, value)) {
@@ -1131,18 +1149,6 @@ std::error_code Database::EnumerateEntries(const std::shared_ptr<FileInfo>& file
   }
 
   return {};
-}
-
-std::error_code Database::EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
-    const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>& cb)
-    const {
-  FileSections sections;
-
-  if (auto ec = LoadFileSections(file, &sections)) {
-    return ec;
-  }
-
-  return EnumerateEntries(file, sections.entries.value(), cb);
 }
 
 Database::ActiveFile& Database::GetActiveFileNoLock(const std::string_view key, bool is_delete) noexcept {
@@ -1216,7 +1222,7 @@ std::error_code Database::ReadValue(
     format::Entry e;
     std::string key;
 
-    if (auto ec = ReadEntryImpl(record.file->fd, offset, true, e, key, value).second) {
+    if (auto ec = ReadEntryImpl(record.file->fd, offset, true, e, key, &value).second) {
       return ec;
     }
     if (const auto& range = options.range) {
@@ -1324,7 +1330,7 @@ std::error_code Database::WriteIndex(const std::shared_ptr<FileInfo>& file) {
 
   format::Footer footer{.entries = sizeof(format::Header), .index = file->size};
   // Write index entries.
-  if (auto ec = EnumerateEntries(file, std::make_pair(footer.entries, footer.index), cb)) {
+  if (auto ec = EnumerateEntries(file, std::make_pair(footer.entries, footer.index), false, cb)) {
     return ec;
   }
   // Write footer.

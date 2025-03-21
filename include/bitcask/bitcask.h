@@ -320,10 +320,7 @@ class Database {
    * @param file a file to enumerate.
    */
   std::error_code EnumerateEntries(const std::shared_ptr<FileInfo>& file, const FileSections::Range& range,
-      const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>&
-          cb) const;
-
-  std::error_code EnumerateEntriesNoLock(const std::shared_ptr<FileInfo>& file,
+      const bool read_values,
       const std::function<std::error_code(const Record&, const bool, std::string_view, std::string_view)>&
           cb) const;
 
